@@ -416,6 +416,16 @@ func (p *Pool) updateStatusWithJob(id int, state WorkerState, device string, job
 	}
 }
 
+// checkAndUpdateBackoffState updates worker state based on current backoff status.
+// This ensures workers show "backing off" state even during active downloads.
+func (p *Pool) checkAndUpdateBackoffState(workerID int, device string, job *Job, progress int, currentDate time.Time) {
+	if p.backoff.IsBackingOff() {
+		p.updateStatusWithJob(workerID, WorkerStateBackingOff, device, job, progress, currentDate)
+	} else {
+		p.updateStatusWithJob(workerID, WorkerStateWorking, device, job, progress, currentDate)
+	}
+}
+
 func (p *Pool) processJob(workerID int, job *Job) JobResult {
 	start := time.Now()
 	result := JobResult{Job: job}
@@ -522,7 +532,7 @@ func (p *Pool) processJob(workerID int, job *Job) JobResult {
 	logging.Info("Downloading timeline for %s from %s to %s",
 		device.ComputerDNSName, job.FromDate.Format("2006-01-02"), job.ToDate.Format("2006-01-02"))
 	progressCallback := func(eventCount int, currentDate time.Time) {
-		p.updateStatusWithJob(workerID, WorkerStateWorking, device.ComputerDNSName, job, eventCount, currentDate)
+		p.checkAndUpdateBackoffState(workerID, device.ComputerDNSName, job, eventCount, currentDate)
 	}
 
 	eventCount, err := p.client.DownloadTimeline(

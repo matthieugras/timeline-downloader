@@ -63,6 +63,15 @@ func (g *GlobalBackoff) ReportError() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
+	now := time.Now()
+
+	// If already backing off, this error is part of the same rate limiting event.
+	// Don't compound the backoff - concurrent in-flight requests failing together
+	// should only trigger one backoff increase, not exponential compounding.
+	if g.backoffUntil.After(now) {
+		return
+	}
+
 	// Reset success streak
 	g.successStreak = 0
 
@@ -71,7 +80,7 @@ func (g *GlobalBackoff) ReportError() {
 	randomJitter := time.Duration(rand.Float64() * jitter)
 	backoffDuration := g.currentInterval + randomJitter
 
-	g.backoffUntil = time.Now().Add(backoffDuration)
+	g.backoffUntil = now.Add(backoffDuration)
 
 	// Notify callback
 	if g.onBackoffStart != nil {

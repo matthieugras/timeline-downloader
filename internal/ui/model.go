@@ -274,13 +274,10 @@ func (m Model) View() string {
 		var statusStr string
 		switch w.State {
 		case worker.WorkerStateIdle:
-			statusStr = WorkerIdleStyle.Render(fmt.Sprintf("  [%d] idle", w.ID))
+			statusStr = WorkerIdleStyle.Render(fmt.Sprintf("  [%2d] idle", w.ID))
 		case worker.WorkerStateWorking:
 			device := w.CurrentDevice
-			maxDeviceLen := 40
-			if w.ChunkLabel != "" {
-				maxDeviceLen = 35 // Shorter device name to make room for chunk label
-			}
+			maxDeviceLen := 35
 			if len(device) > maxDeviceLen {
 				device = device[:maxDeviceLen-3] + "..."
 			}
@@ -301,12 +298,22 @@ func (m Model) View() string {
 			}
 			progressBar := m.workerProgress[i].ViewAs(pct)
 			if w.ChunkLabel != "" {
-				statusStr = WorkerWorkingStyle.Render(fmt.Sprintf("  [%d] %-35s [%s] %s %3.0f%% (%d)", w.ID, device, w.ChunkLabel, progressBar, pct*100, w.Progress))
+				statusStr = WorkerWorkingStyle.Render(fmt.Sprintf("  [%2d] %-35s [%5s] %s %3.0f%% (%d)", w.ID, device, w.ChunkLabel, progressBar, pct*100, w.Progress))
 			} else {
-				statusStr = WorkerWorkingStyle.Render(fmt.Sprintf("  [%d] %-40s %s %3.0f%% (%d)", w.ID, device, progressBar, pct*100, w.Progress))
+				statusStr = WorkerWorkingStyle.Render(fmt.Sprintf("  [%2d] %-35s         %s %3.0f%% (%d)", w.ID, device, progressBar, pct*100, w.Progress))
 			}
 		case worker.WorkerStateBackingOff:
-			statusStr = WorkerBackoffStyle.Render(fmt.Sprintf("  [%d] backing off...", w.ID))
+			device := w.CurrentDevice
+			maxDeviceLen := 35
+			if len(device) > maxDeviceLen {
+				device = device[:maxDeviceLen-3] + "..."
+			}
+			progressBar := m.workerProgress[i].ViewAs(0) // Show empty/paused bar
+			if w.ChunkLabel != "" {
+				statusStr = WorkerBackoffStyle.Render(fmt.Sprintf("  [%2d] %-35s [%5s] %s backing off...", w.ID, device, w.ChunkLabel, progressBar))
+			} else {
+				statusStr = WorkerBackoffStyle.Render(fmt.Sprintf("  [%2d] %-35s         %s backing off...", w.ID, device, progressBar))
+			}
 		case worker.WorkerStateMerging:
 			device := w.CurrentDevice
 			if len(device) > 35 {
@@ -324,10 +331,10 @@ func (m Model) View() string {
 			mbCopied := float64(w.BytesCopied) / (1024 * 1024)
 			mbTotal := float64(w.TotalBytes) / (1024 * 1024)
 			statusStr = WorkerMergingStyle.Render(
-				fmt.Sprintf("  [%d] %-35s [merge] %s %6.1f/%6.1f MB",
+				fmt.Sprintf("  [%2d] %-35s [merge] %s %6.1f/%6.1f MB",
 					w.ID, device, progressBar, mbCopied, mbTotal))
 		case worker.WorkerStateDone:
-			statusStr = MutedStyle.Render(fmt.Sprintf("  [%d] done", w.ID))
+			statusStr = MutedStyle.Render(fmt.Sprintf("  [%2d] done", w.ID))
 		}
 		b.WriteString(statusStr + "\n")
 	}

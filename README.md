@@ -107,6 +107,7 @@ Uses browser session cookies for authentication. Useful when refresh tokens are 
 | `--log-file` | | Log file path | |
 | `--backoff-initial` | | Initial backoff | 1s |
 | `--backoff-max` | | Maximum backoff | 60s |
+| `--timeout` | | HTTP request timeout | 5m |
 | `--generate-identity-events` | | Include identity generation events | true |
 | `--include-identity-events` | | Include identity events | true |
 | `--support-mdi-only-events` | | Include MDI-only events | true |

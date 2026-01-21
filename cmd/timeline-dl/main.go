@@ -85,7 +85,7 @@ func run(cmd *cobra.Command, args []string) error {
 	// Create shared HTTP client for connection pooling across all components
 	// This enables TCP Keep-Alive reuse and centralized timeout configuration
 	httpClient := &http.Client{
-		Timeout: 60 * time.Second,
+		Timeout: cfg.HTTPTimeout,
 		Transport: &http.Transport{
 			MaxIdleConns:        100,
 			MaxIdleConnsPerHost: 10,

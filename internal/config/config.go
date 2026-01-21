@@ -40,6 +40,9 @@ type Config struct {
 	BackoffInitial time.Duration `mapstructure:"backoff-initial"`
 	BackoffMax     time.Duration `mapstructure:"backoff-max"`
 
+	// HTTP client
+	HTTPTimeout time.Duration `mapstructure:"timeout"`
+
 	// Logging
 	Verbose bool   `mapstructure:"verbose"`
 	LogFile string `mapstructure:"log-file"`
@@ -94,15 +97,17 @@ func SetupFlags(cmd *cobra.Command) {
 
 	// Processing flags
 	cmd.Flags().IntP("workers", "w", 5, "Number of parallel workers")
-	cmd.Flags().IntP("batch-size", "b", 10, "Devices per batch")
 	cmd.Flags().Int("timechunk", 0, "Split device downloads into N-day chunks for parallel processing (0=disabled)")
 
 	// Output flags
 	cmd.Flags().StringP("output", "o", "./output", "Output directory for JSONL files")
 
 	// Backoff flags
-	cmd.Flags().Duration("backoff-initial", time.Second, "Initial backoff interval")
+	cmd.Flags().Duration("backoff-initial", 5*time.Second, "Initial backoff interval")
 	cmd.Flags().Duration("backoff-max", 60*time.Second, "Maximum backoff interval")
+
+	// HTTP client flags
+	cmd.Flags().Duration("timeout", 5*time.Minute, "HTTP client timeout for API requests")
 
 	// Other flags
 	cmd.Flags().BoolP("verbose", "v", false, "Enable verbose logging")
@@ -116,7 +121,7 @@ func SetupFlags(cmd *cobra.Command) {
 	cmd.Flags().Int("page-size", 999, "Number of events per API page (1-999)")
 
 	// Retry settings
-	cmd.Flags().Int("max-retries", 6, "Maximum retries for API requests")
+	cmd.Flags().Int("max-retries", 10, "Maximum retries for API requests")
 
 	// Mark required flags (client-id has a default so not required)
 	cmd.MarkFlagRequired("tenant-id")
