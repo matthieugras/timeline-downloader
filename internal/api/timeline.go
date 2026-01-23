@@ -72,6 +72,8 @@ func (c *Client) DownloadTimeline(
 			if !nextFromDate.IsZero() {
 				progressCallback(eventCount, nextFromDate)
 			} else {
+				// Warn if we couldn't parse the date - API format may have changed
+				logging.Warn("Could not parse fromDate from pagination URL, using original fromDate for progress")
 				progressCallback(eventCount, fromDate)
 			}
 		}
@@ -94,33 +96,25 @@ func (c *Client) buildTimelineURL(device *Device, fromDate, toDate time.Time) st
 		toDate = maxToDate
 	}
 
-	fromDateStr := fromDate.UTC().Format("2006-01-02T15:04:05.0000000Z")
-	toDateStr := toDate.UTC().Format("2006-01-02T15:04:05.0000000Z")
-
 	opts := c.timelineOptions
-	return fmt.Sprintf("/apiproxy/mtp/mdeTimelineExperience/machines/%s/events/?"+
-		"machineDnsName=%s"+
-		"&SenseClientVersion=%s"+
-		"&generateIdentityEvents=%t"+
-		"&includeIdentityEvents=%t"+
-		"&supportMdiOnlyEvents=%t"+
-		"&fromDate=%s"+
-		"&toDate=%s"+
-		"&doNotUseCache=false"+
-		"&forceUseCache=false"+
-		"&pageSize=%d"+
-		"&includeSentinelEvents=%t"+
-		"&IsScrollingForward=true",
-		device.MachineID,
-		device.ComputerDNSName,
-		device.SenseClientVersion,
-		opts.GenerateIdentityEvents,
-		opts.IncludeIdentityEvents,
-		opts.SupportMdiOnlyEvents,
-		fromDateStr,
-		toDateStr,
-		opts.PageSize,
-		opts.IncludeSentinelEvents)
+
+	// Build query parameters using url.Values for proper encoding and readability
+	q := url.Values{}
+	q.Set("machineDnsName", device.ComputerDNSName)
+	q.Set("SenseClientVersion", device.SenseClientVersion)
+	q.Set("generateIdentityEvents", fmt.Sprintf("%t", opts.GenerateIdentityEvents))
+	q.Set("includeIdentityEvents", fmt.Sprintf("%t", opts.IncludeIdentityEvents))
+	q.Set("supportMdiOnlyEvents", fmt.Sprintf("%t", opts.SupportMdiOnlyEvents))
+	q.Set("fromDate", fromDate.UTC().Format("2006-01-02T15:04:05.0000000Z"))
+	q.Set("toDate", toDate.UTC().Format("2006-01-02T15:04:05.0000000Z"))
+	q.Set("doNotUseCache", "false")
+	q.Set("forceUseCache", "false")
+	q.Set("pageSize", fmt.Sprintf("%d", opts.PageSize))
+	q.Set("includeSentinelEvents", fmt.Sprintf("%t", opts.IncludeSentinelEvents))
+	q.Set("IsScrollingForward", "true")
+
+	return fmt.Sprintf("/apiproxy/mtp/mdeTimelineExperience/machines/%s/events/?%s",
+		device.MachineID, q.Encode())
 }
 
 // parseFromDateFromURL extracts the fromDate query parameter from a pagination URL

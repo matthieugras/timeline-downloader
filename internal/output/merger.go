@@ -50,7 +50,7 @@ func MergeChunkFiles(chunkFiles []string, outputPath string, deleteChunks bool) 
 
 // MergeChunkFilesWithProgress merges chunk files with progress reporting.
 // The callback is called periodically with bytes copied and total bytes.
-func MergeChunkFilesWithProgress(chunkFiles []string, outputPath string, deleteChunks bool, callback MergeProgressCallback) (int64, error) {
+func MergeChunkFilesWithProgress(chunkFiles []string, outputPath string, deleteChunks bool, callback MergeProgressCallback) (bytesWritten int64, err error) {
 	if len(chunkFiles) == 0 {
 		return 0, nil
 	}
@@ -69,7 +69,13 @@ func MergeChunkFilesWithProgress(chunkFiles []string, outputPath string, deleteC
 	if err != nil {
 		return 0, fmt.Errorf("failed to create output file %s: %w", outputPath, err)
 	}
-	defer outFile.Close()
+
+	// Clean up partial file on error (must be deferred before close to run after close fails)
+	defer func() {
+		if err != nil {
+			os.Remove(outputPath)
+		}
+	}()
 
 	// Use counting writer if callback provided
 	var writer io.Writer = outFile
@@ -79,13 +85,20 @@ func MergeChunkFilesWithProgress(chunkFiles []string, outputPath string, deleteC
 		callback(0, totalBytes)
 	}
 
-	var bytesWritten int64
 	for _, chunkFile := range chunkFiles {
-		n, err := appendFileToWriter(writer, chunkFile)
-		if err != nil {
+		n, appendErr := appendFileToWriter(writer, chunkFile)
+		if appendErr != nil {
+			err = appendErr
 			return bytesWritten, err
 		}
 		bytesWritten += n
+	}
+
+	// Close file and check for errors (e.g., disk full during flush)
+	// This must happen before we report success or delete source files
+	if closeErr := outFile.Close(); closeErr != nil {
+		err = fmt.Errorf("failed to close output file %s: %w", outputPath, closeErr)
+		return bytesWritten, err
 	}
 
 	// Final callback
@@ -130,3 +143,4 @@ func appendFileToWriter(dst io.Writer, srcPath string) (int64, error) {
 	}
 	return n, nil
 }
+

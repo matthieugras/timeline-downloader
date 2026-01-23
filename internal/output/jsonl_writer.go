@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/matthieugras/timeline-downloader/internal/logging"
 )
 
 // EventWriter is the interface for writing timeline events
@@ -16,6 +18,10 @@ type EventWriter interface {
 	Write(data json.RawMessage) error
 	Close() error
 }
+
+// TimestampExtractor extracts a timestamp from an event for filtering.
+// Return zero time to skip the event (missing timestamp).
+type TimestampExtractor func(data json.RawMessage) (time.Time, error)
 
 // actionTimeEvent is used to extract ActionTime from raw event JSON
 type actionTimeEvent struct {
@@ -36,22 +42,25 @@ func getEventActionTime(data json.RawMessage) (time.Time, error) {
 	return time.Parse(time.RFC3339, event.ActionTimeIsoString)
 }
 
-// JSONLWriter writes JSON objects as newline-delimited JSON (JSONL) with date filtering.
-// Events are filtered by ActionTime: only events with ActionTime >= from AND ActionTime < to are written.
+// JSONLWriter writes JSON objects as newline-delimited JSON (JSONL).
+// If a timestamp extractor is provided, events are filtered by [from, to).
+// If no extractor is provided, all events are written without filtering.
 type JSONLWriter struct {
-	file   *os.File
-	writer *bufio.Writer // Buffered writer for better I/O performance
-	from   time.Time
-	to     time.Time
-	mu     sync.Mutex
+	file             *os.File
+	writer           *bufio.Writer // Buffered writer for better I/O performance
+	from             time.Time
+	to               time.Time
+	timestampExtract TimestampExtractor // nil = no filtering
+	mu               sync.Mutex
 
 	writtenCount  int
 	filteredCount int
 	closed        bool
 }
 
-// NewJSONLWriter creates a new JSONL writer at the specified path with date filtering.
+// NewJSONLWriter creates a new JSONL writer at the specified path with ActionTime filtering.
 // Only events with ActionTime >= from AND ActionTime < to will be written.
+// Used for device timeline downloads.
 func NewJSONLWriter(path string, from, to time.Time) (*JSONLWriter, error) {
 	// Ensure directory exists
 	dir := filepath.Dir(path)
@@ -67,15 +76,40 @@ func NewJSONLWriter(path string, from, to time.Time) (*JSONLWriter, error) {
 	}
 
 	return &JSONLWriter{
-		file:   file,
-		writer: bufio.NewWriterSize(file, 64*1024), // 64KB buffer
-		from:   from,
-		to:     to,
+		file:             file,
+		writer:           bufio.NewWriterSize(file, 64*1024), // 64KB buffer
+		from:             from,
+		to:               to,
+		timestampExtract: getEventActionTime, // Filter by ActionTime
 	}, nil
 }
 
-// Write writes a JSON event if its ActionTime falls within the filter range.
-// If ActionTime cannot be parsed, the event is included (fail open).
+// NewIdentityJSONLWriter creates a new JSONL writer for identity timeline events.
+// No filtering is performed - the API guarantees events are already within [from, to).
+func NewIdentityJSONLWriter(path string) (*JSONLWriter, error) {
+	// Ensure directory exists
+	dir := filepath.Dir(path)
+	if dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create output directory: %w", err)
+		}
+	}
+
+	file, err := os.Create(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create output file: %w", err)
+	}
+
+	return &JSONLWriter{
+		file:             file,
+		writer:           bufio.NewWriterSize(file, 64*1024), // 64KB buffer
+		timestampExtract: nil,                                // No filtering
+	}, nil
+}
+
+// Write writes a JSON event.
+// If a timestamp extractor is configured, events are filtered by [from, to).
+// Events with unparseable or missing timestamps are skipped when filtering is enabled.
 func (w *JSONLWriter) Write(data json.RawMessage) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -84,22 +118,24 @@ func (w *JSONLWriter) Write(data json.RawMessage) error {
 		return fmt.Errorf("writer is closed")
 	}
 
-	// Parse ActionTime from the event
-	actionTime, err := getEventActionTime(data)
-	if err != nil {
-		// If we can't parse ActionTime, include the event (fail open)
-		return w.writeData(data)
-	}
-
-	// If ActionTime is zero (missing field), include the event
-	if actionTime.IsZero() {
-		return w.writeData(data)
-	}
-
-	// Filter: include if actionTime >= from AND actionTime < to
-	if actionTime.Before(w.from) || !actionTime.Before(w.to) {
-		w.filteredCount++
-		return nil
+	// Apply filtering only if extractor is configured
+	if w.timestampExtract != nil {
+		ts, err := w.timestampExtract(data)
+		if err != nil {
+			logging.Warn("Event skipped: unparseable timestamp: %v", err)
+			w.filteredCount++
+			return nil
+		}
+		if ts.IsZero() {
+			logging.Debug("Event skipped: missing timestamp")
+			w.filteredCount++
+			return nil
+		}
+		// Filter: include if ts >= from AND ts < to
+		if ts.Before(w.from) || !ts.Before(w.to) {
+			w.filteredCount++
+			return nil
+		}
 	}
 
 	return w.writeData(data)
@@ -220,6 +256,53 @@ func (fm *FileManager) GetFinalPath(hostname, machineID string) string {
 	filename := fmt.Sprintf("%s_%s_timeline.jsonl",
 		sanitizeFilename(hostname),
 		machineID)
+	return filepath.Join(fm.outputDir, filename)
+}
+
+// GetIdentityWriter returns a new writer for an identity timeline.
+// No date filtering is performed - the API guarantees events are within [from, to).
+// File naming: {accountName}_{accountDomain}_identity_timeline.jsonl
+// The caller is responsible for closing the writer when done.
+func (fm *FileManager) GetIdentityWriter(accountName, accountDomain string) (*JSONLWriter, string, error) {
+	filename := fmt.Sprintf("%s_%s_identity_timeline.jsonl",
+		sanitizeFilename(accountName),
+		sanitizeFilename(accountDomain))
+
+	path := filepath.Join(fm.outputDir, filename)
+
+	writer, err := NewIdentityJSONLWriter(path)
+	if err != nil {
+		return nil, "", err
+	}
+
+	return writer, path, nil
+}
+
+// GetIdentityChunkWriter returns a new writer for an identity chunk file.
+// No date filtering is performed - the API guarantees events are within [from, to).
+// File naming: {accountName}_{accountDomain}_identity_timeline_chunk_{N}.jsonl
+// The caller is responsible for closing the writer when done.
+func (fm *FileManager) GetIdentityChunkWriter(accountName, accountDomain string, chunkIndex int) (*JSONLWriter, string, error) {
+	filename := fmt.Sprintf("%s_%s_identity_timeline_chunk_%d.jsonl",
+		sanitizeFilename(accountName),
+		sanitizeFilename(accountDomain),
+		chunkIndex)
+
+	path := filepath.Join(fm.outputDir, filename)
+
+	writer, err := NewIdentityJSONLWriter(path)
+	if err != nil {
+		return nil, "", err
+	}
+
+	return writer, path, nil
+}
+
+// GetIdentityFinalPath returns the final output path for an identity (used after merging chunks)
+func (fm *FileManager) GetIdentityFinalPath(accountName, accountDomain string) string {
+	filename := fmt.Sprintf("%s_%s_identity_timeline.jsonl",
+		sanitizeFilename(accountName),
+		sanitizeFilename(accountDomain))
 	return filepath.Join(fm.outputDir, filename)
 }
 

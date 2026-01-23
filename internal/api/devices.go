@@ -75,6 +75,10 @@ func (c *Client) GetDevice(ctx context.Context, machineID string) (*Device, erro
 		return nil, fmt.Errorf("device %s has no SenseClientVersion", device.ComputerDNSName)
 	}
 
+	if device.MachineID == "" {
+		return nil, fmt.Errorf("device %s has no MachineID (required for deduplication)", device.ComputerDNSName)
+	}
+
 	return &device, nil
 }
 

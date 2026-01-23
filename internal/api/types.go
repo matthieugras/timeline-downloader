@@ -6,6 +6,14 @@ import (
 	"time"
 )
 
+// ResolvedEntity is a sealed interface implemented by Device and Identity.
+// Used for type-safe entity caching in the worker pool.
+type ResolvedEntity interface {
+	isResolvedEntity() // unexported method makes this a sealed interface
+	EntityDisplayName() string
+	PrimaryKey() string // unique identifier for deduplication (machineId for devices, radiusUserId for identities)
+}
+
 // Device represents a machine from Microsoft Defender
 type Device struct {
 	MachineID          string    `json:"MachineId"`
@@ -20,6 +28,19 @@ type Device struct {
 	HealthStatus       string    `json:"HealthStatus"`
 	RiskScore          string    `json:"RiskScore"`
 	Domain             string    `json:"Domain"`
+}
+
+// Implement ResolvedEntity for Device
+func (*Device) isResolvedEntity() {}
+
+// EntityDisplayName returns the display name for the device
+func (d *Device) EntityDisplayName() string {
+	return d.ComputerDNSName
+}
+
+// PrimaryKey returns the unique identifier for deduplication (MachineId)
+func (d *Device) PrimaryKey() string {
+	return d.MachineID
 }
 
 // MachineSearchResult represents a single machine from the search API

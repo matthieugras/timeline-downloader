@@ -90,12 +90,10 @@ func (g *GlobalBackoff) ReportError() {
 	// Increase interval for next time (exponential)
 	g.currentInterval = min(time.Duration(float64(g.currentInterval)*g.config.Multiplier), g.config.MaxInterval)
 
-	// Schedule callback for backoff end
+	// Schedule callback for backoff end using AfterFunc instead of blocking goroutine.
+	// This is cleaner and doesn't block a user-space goroutine on a sleep syscall.
 	if g.onBackoffEnd != nil {
-		go func(duration time.Duration, callback func()) {
-			time.Sleep(duration)
-			callback()
-		}(backoffDuration, g.onBackoffEnd)
+		time.AfterFunc(backoffDuration, g.onBackoffEnd)
 	}
 }
 

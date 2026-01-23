@@ -17,6 +17,7 @@ type Model struct {
 	totalDevices     int
 	completedDevices int
 	failedDevices    int
+	skippedDevices   int
 	totalEvents      int
 
 	// Worker tracking
@@ -57,12 +58,14 @@ type Model struct {
 }
 
 type resultInfo struct {
-	hostname   string
-	eventCount int
-	success    bool
-	errorMsg   string
-	isMerge    bool   // true for merge results
-	chunkLabel string // e.g., "1/4" for chunk downloads
+	hostname      string
+	eventCount    int
+	success       bool
+	errorMsg      string
+	isMerge       bool   // true for merge results
+	chunkLabel    string // e.g., "1/4" for chunk downloads
+	skipped       bool   // true if job was skipped (e.g., duplicate)
+	skippedReason string // reason for skipping
 }
 
 // Message types
@@ -145,47 +148,47 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case ResultMsg:
 		result := worker.JobResult(msg)
+		// Determine display name based on job type
+		displayName := ""
+		isMerge := result.Job.MergeInfo != nil
+		if result.Device != nil {
+			displayName = result.Device.ComputerDNSName
+		} else if result.Identity != nil {
+			displayName = result.Identity.EntityDisplayName()
+		} else if isMerge {
+			displayName = result.Job.MergeInfo.Hostname
+		} else {
+			displayName = result.Job.EntityDisplayName()
+		}
+		chunkLabel := ""
+		if result.Job.ChunkInfo != nil {
+			chunkLabel = result.Job.ChunkInfo.ChunkLabel()
+		}
+
 		if result.Error != nil {
 			m.failedDevices++
-			// Get hostname based on job type
-			hostname := ""
-			isMerge := result.Job.MergeInfo != nil
-			chunkLabel := ""
-			if result.Device != nil {
-				hostname = result.Device.ComputerDNSName
-			} else if isMerge {
-				hostname = result.Job.MergeInfo.Hostname
-			} else {
-				hostname = result.Job.DeviceInput.Value
-			}
-			if result.Job.ChunkInfo != nil {
-				chunkLabel = result.Job.ChunkInfo.ChunkLabel()
-			}
 			m.addRecentResult(resultInfo{
-				hostname:   hostname,
+				hostname:   displayName,
 				success:    false,
 				errorMsg:   result.Error.Error(),
 				isMerge:    isMerge,
 				chunkLabel: chunkLabel,
 			})
-			m.errors = append(m.errors, fmt.Sprintf("%s: %v", hostname, result.Error))
+			m.errors = append(m.errors, fmt.Sprintf("%s: %v", displayName, result.Error))
+		} else if result.Skipped {
+			m.skippedDevices++
+			m.addRecentResult(resultInfo{
+				hostname:      displayName,
+				skipped:       true,
+				skippedReason: result.SkippedReason,
+				isMerge:       isMerge,
+				chunkLabel:    chunkLabel,
+			})
 		} else {
 			m.completedDevices++
 			m.totalEvents += result.EventCount
-			// Get hostname (merge jobs have nil Device, use MergeInfo.Hostname instead)
-			hostname := ""
-			isMerge := result.Job.MergeInfo != nil
-			chunkLabel := ""
-			if result.Device != nil {
-				hostname = result.Device.ComputerDNSName
-			} else if isMerge {
-				hostname = result.Job.MergeInfo.Hostname
-			}
-			if result.Job.ChunkInfo != nil {
-				chunkLabel = result.Job.ChunkInfo.ChunkLabel()
-			}
 			m.addRecentResult(resultInfo{
-				hostname:   hostname,
+				hostname:   displayName,
 				eventCount: result.EventCount,
 				success:    true,
 				isMerge:    isMerge,
@@ -193,7 +196,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			})
 		}
 		// Stop timer when all devices are processed
-		if m.completedDevices+m.failedDevices >= m.totalDevices && m.finishTime.IsZero() {
+		if m.completedDevices+m.failedDevices+m.skippedDevices >= m.totalDevices && m.finishTime.IsZero() {
 			m.finishTime = time.Now()
 		}
 		return m, waitForResult(m.resultsCh)
@@ -247,7 +250,7 @@ func (m Model) View() string {
 	b.WriteString(header + "\n\n")
 
 	// Overall progress
-	completed := m.completedDevices + m.failedDevices
+	completed := m.completedDevices + m.failedDevices + m.skippedDevices
 	pct := float64(completed) / float64(m.totalDevices)
 	progressBar := m.overallProgress.ViewAs(pct)
 	progressLine := fmt.Sprintf("Progress: %s %d/%d jobs",
@@ -261,9 +264,10 @@ func (m Model) View() string {
 	} else {
 		elapsed = m.finishTime.Sub(m.startTime).Round(time.Second)
 	}
-	stats := fmt.Sprintf("Completed: %s  Failed: %s  Events: %s  Elapsed: %s",
+	stats := fmt.Sprintf("Completed: %s  Failed: %s  Skipped: %s  Events: %s  Elapsed: %s",
 		SuccessStyle.Render(fmt.Sprintf("%d", m.completedDevices)),
 		ErrorStyle.Render(fmt.Sprintf("%d", m.failedDevices)),
+		SkippedStyle.Render(fmt.Sprintf("%d", m.skippedDevices)),
 		HighlightStyle.Render(fmt.Sprintf("%d", m.totalEvents)),
 		elapsed)
 	b.WriteString(stats + "\n\n")
@@ -352,7 +356,13 @@ func (m Model) View() string {
 		b.WriteString("\n" + MutedStyle.Render("Recent:") + "\n")
 		for _, r := range m.recentResults {
 			var resultLine string
-			if r.success {
+			if r.skipped {
+				reason := r.skippedReason
+				if len(reason) > 50 {
+					reason = reason[:47] + "..."
+				}
+				resultLine = SkippedStyle.Render(fmt.Sprintf("  ⊘ %s: %s", r.hostname, reason))
+			} else if r.success {
 				if r.isMerge {
 					// Merge results: no event count
 					resultLine = SuccessStyle.Render(fmt.Sprintf("  ✓ %s (merged)", r.hostname))
@@ -398,6 +408,7 @@ func (m Model) renderFinalSummary() string {
 	b.WriteString(fmt.Sprintf("Total jobs:     %d\n", m.totalDevices))
 	b.WriteString(fmt.Sprintf("Completed:      %s\n", SuccessStyle.Render(fmt.Sprintf("%d", m.completedDevices))))
 	b.WriteString(fmt.Sprintf("Failed:         %s\n", ErrorStyle.Render(fmt.Sprintf("%d", m.failedDevices))))
+	b.WriteString(fmt.Sprintf("Skipped:        %s\n", SkippedStyle.Render(fmt.Sprintf("%d", m.skippedDevices))))
 	b.WriteString(fmt.Sprintf("Total events:   %s\n", HighlightStyle.Render(fmt.Sprintf("%d", m.totalEvents))))
 	b.WriteString(fmt.Sprintf("Duration:       %s\n", elapsed))
 

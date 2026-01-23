@@ -20,9 +20,13 @@ type Config struct {
 	RefreshToken string `mapstructure:"refresh-token"`
 	ESTSCookie   string `mapstructure:"ests-cookie"` // ESTSAUTHPERSISTENT cookie value
 
-	// Input
+	// Input - Devices
 	Devices    []string `mapstructure:"devices"`
 	DeviceFile string   `mapstructure:"file"`
+
+	// Input - Identities
+	Identities   []string `mapstructure:"identities"`
+	IdentityFile string   `mapstructure:"identity-file"`
 
 	// Time range
 	FromDate time.Time
@@ -86,9 +90,13 @@ func SetupFlags(cmd *cobra.Command) {
 	cmd.Flags().String("refresh-token", "", "OAuth refresh token (or set MDE_REFRESH_TOKEN env var)")
 	cmd.Flags().String("ests-cookie", "", "ESTSAUTHPERSISTENT cookie value (or set MDE_ESTS_COOKIE env var)")
 
-	// Input flags
+	// Input flags - Devices
 	cmd.Flags().StringSliceP("devices", "d", nil, "Comma-separated list of hostnames or machine IDs (auto-detected)")
 	cmd.Flags().StringP("file", "f", "", "File containing hostnames/machine IDs (one per line)")
+
+	// Input flags - Identities
+	cmd.Flags().StringSlice("identities", nil, "Comma-separated list of identity search terms (usernames, UPNs)")
+	cmd.Flags().String("identity-file", "", "File containing identity search terms (one per line)")
 
 	// Time range flags
 	cmd.Flags().String("from", "", "Start date (RFC3339 format, e.g., 2025-12-01T00:00:00Z)")
@@ -164,6 +172,11 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	// Load identities from file if specified
+	if err := cfg.loadIdentities(); err != nil {
+		return nil, err
+	}
+
 	// Validate configuration
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -195,36 +208,55 @@ func (c *Config) parseDateRange() error {
 	return nil
 }
 
-func (c *Config) loadDevices() error {
+// loadEntities loads and deduplicates entities from flags and an optional file.
+// Returns deduplicated list of entities.
+func loadEntities(flagValues []string, filePath string, entityType string) ([]string, error) {
 	seen := make(map[string]bool)
-	var uniqueDevices []string
+	var unique []string
 
-	// Deduplicate devices from flags
-	for _, d := range c.Devices {
-		d = strings.TrimSpace(d)
-		if d != "" && !seen[d] {
-			seen[d] = true
-			uniqueDevices = append(uniqueDevices, d)
+	// Deduplicate from flags
+	for _, v := range flagValues {
+		v = strings.TrimSpace(v)
+		if v != "" && !seen[v] {
+			seen[v] = true
+			unique = append(unique, v)
 		}
 	}
 
-	// Add devices from file (also deduplicated)
-	if c.DeviceFile != "" {
-		data, err := os.ReadFile(c.DeviceFile)
+	// Add from file (also deduplicated)
+	if filePath != "" {
+		data, err := os.ReadFile(filePath)
 		if err != nil {
-			return fmt.Errorf("failed to read device file: %w", err)
+			return nil, fmt.Errorf("failed to read %s file: %w", entityType, err)
 		}
 
 		for line := range strings.SplitSeq(string(data), "\n") {
 			line = strings.TrimSpace(line)
 			if line != "" && !strings.HasPrefix(line, "#") && !seen[line] {
 				seen[line] = true
-				uniqueDevices = append(uniqueDevices, line)
+				unique = append(unique, line)
 			}
 		}
 	}
 
-	c.Devices = uniqueDevices
+	return unique, nil
+}
+
+func (c *Config) loadDevices() error {
+	devices, err := loadEntities(c.Devices, c.DeviceFile, "device")
+	if err != nil {
+		return err
+	}
+	c.Devices = devices
+	return nil
+}
+
+func (c *Config) loadIdentities() error {
+	identities, err := loadEntities(c.Identities, c.IdentityFile, "identity")
+	if err != nil {
+		return err
+	}
+	c.Identities = identities
 	return nil
 }
 
@@ -252,8 +284,8 @@ func (c *Config) Validate() error {
 		c.ClientID = auth.DefaultClientID
 	}
 
-	if len(c.Devices) == 0 {
-		return fmt.Errorf("at least one device must be specified (via --devices or --file)")
+	if len(c.Devices) == 0 && len(c.Identities) == 0 {
+		return fmt.Errorf("at least one device or identity must be specified (via --devices, --file, --identities, or --identity-file)")
 	}
 	if c.FromDate.After(c.ToDate) || c.FromDate.Equal(c.ToDate) {
 		return fmt.Errorf("from date must be before to date")

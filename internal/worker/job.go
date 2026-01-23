@@ -15,6 +15,14 @@ const (
 	JobTypeMerge
 )
 
+// EntityType distinguishes device vs identity jobs
+type EntityType int
+
+const (
+	EntityTypeDevice EntityType = iota
+	EntityTypeIdentity
+)
+
 // ChunkInfo holds information about a time chunk for parallel processing
 type ChunkInfo struct {
 	ChunkIndex  int    // 0-based index
@@ -38,26 +46,62 @@ func (c *ChunkInfo) ChunkLabel() string {
 	return fmt.Sprintf("%d/%d", c.ChunkIndex+1, c.TotalChunks)
 }
 
-// Job represents a device timeline download job
+// Job represents a timeline download job (device or identity)
 type Job struct {
-	ID          int
-	Type        JobType
-	DeviceInput api.DeviceInput
-	FromDate    time.Time
-	ToDate      time.Time
-	ChunkInfo   *ChunkInfo // nil if not chunked
-	MergeInfo   *MergeInfo // nil unless JobTypeMerge
+	ID            int
+	Type          JobType
+	EntityType    EntityType        // Device or Identity
+	DeviceInput   api.DeviceInput   // Used when EntityType == EntityTypeDevice
+	IdentityInput api.IdentityInput // Used when EntityType == EntityTypeIdentity
+	FromDate      time.Time
+	ToDate        time.Time
+	ChunkInfo     *ChunkInfo // nil if not chunked
+	MergeInfo     *MergeInfo // nil unless JobTypeMerge
+}
+
+// EntityKey returns a unique key for this job's entity (for caching/grouping).
+// Keys are prefixed by type to avoid collisions.
+func (j *Job) EntityKey() string {
+	if j.EntityType == EntityTypeIdentity {
+		return "identity:" + j.IdentityInput.Value
+	}
+	return "device:" + j.DeviceInput.Value
+}
+
+// EntityDisplayName returns a display name for the entity (for UI)
+func (j *Job) EntityDisplayName() string {
+	if j.EntityType == EntityTypeIdentity {
+		return j.IdentityInput.Value
+	}
+	return j.DeviceInput.Value
 }
 
 // JobResult represents the result of a job
 type JobResult struct {
-	Job        *Job
-	Device     *api.Device
-	EventCount int
-	OutputFile string
-	Error      error
-	Duration   time.Duration
-	Fatal      bool // If true, abort the entire collection
+	Job           *Job
+	Device        *api.Device   // Set for device jobs
+	Identity      *api.Identity // Set for identity jobs
+	EventCount    int
+	OutputFile    string
+	Error         error
+	Duration      time.Duration
+	Fatal         bool   // If true, abort the entire collection
+	Skipped       bool   // If true, job was skipped (e.g., duplicate entity)
+	SkippedReason string // Reason for skipping
+}
+
+// ResolvedName returns the resolved display name (hostname or account name)
+func (r *JobResult) ResolvedName() string {
+	if r.Device != nil {
+		return r.Device.ComputerDNSName
+	}
+	if r.Identity != nil {
+		if r.Identity.AccountDomain != "" {
+			return r.Identity.AccountName + "@" + r.Identity.AccountDomain
+		}
+		return r.Identity.AccountName
+	}
+	return ""
 }
 
 // JobStatus represents the status of a job
