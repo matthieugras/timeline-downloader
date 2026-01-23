@@ -1,6 +1,7 @@
 package output
 
 import (
+	"compress/gzip"
 	"fmt"
 	"io"
 	"os"
@@ -43,14 +44,16 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 
 // MergeChunkFiles merges multiple chunk JSONL files into a single output file.
 // Files are concatenated in order using streaming byte copy (no memory buffering).
-// Returns the total bytes written.
-func MergeChunkFiles(chunkFiles []string, outputPath string, deleteChunks bool) (int64, error) {
-	return MergeChunkFilesWithProgress(chunkFiles, outputPath, deleteChunks, nil)
+// If useGzip is true, the output is compressed with gzip.
+// Returns the total bytes written (uncompressed).
+func MergeChunkFiles(chunkFiles []string, outputPath string, deleteChunks bool, useGzip bool) (int64, error) {
+	return MergeChunkFilesWithProgress(chunkFiles, outputPath, deleteChunks, useGzip, nil)
 }
 
 // MergeChunkFilesWithProgress merges chunk files with progress reporting.
 // The callback is called periodically with bytes copied and total bytes.
-func MergeChunkFilesWithProgress(chunkFiles []string, outputPath string, deleteChunks bool, callback MergeProgressCallback) (int64, error) {
+// If useGzip is true, the output is compressed with gzip.
+func MergeChunkFilesWithProgress(chunkFiles []string, outputPath string, deleteChunks bool, useGzip bool, callback MergeProgressCallback) (bytesWritten int64, err error) {
 	if len(chunkFiles) == 0 {
 		return 0, nil
 	}
@@ -69,23 +72,52 @@ func MergeChunkFilesWithProgress(chunkFiles []string, outputPath string, deleteC
 	if err != nil {
 		return 0, fmt.Errorf("failed to create output file %s: %w", outputPath, err)
 	}
-	defer outFile.Close()
 
-	// Use counting writer if callback provided
-	var writer io.Writer = outFile
+	// Clean up partial file on error (must be deferred before close to run after close fails)
+	defer func() {
+		if err != nil {
+			os.Remove(outputPath)
+		}
+	}()
+
+	// Setup writer chain: outFile -> [gzipWriter] -> [countingWriter]
+	var baseWriter io.Writer = outFile
+	var gzipWriter *gzip.Writer
+
+	if useGzip {
+		gzipWriter = gzip.NewWriter(outFile)
+		baseWriter = gzipWriter
+	}
+
+	var writer io.Writer = baseWriter
 	if callback != nil {
-		writer = newCountingWriter(outFile, totalBytes, callback)
+		writer = newCountingWriter(baseWriter, totalBytes, callback)
 		// Initial callback
 		callback(0, totalBytes)
 	}
 
-	var bytesWritten int64
 	for _, chunkFile := range chunkFiles {
-		n, err := appendFileToWriter(writer, chunkFile)
-		if err != nil {
+		n, appendErr := appendFileToWriter(writer, chunkFile)
+		if appendErr != nil {
+			err = appendErr
 			return bytesWritten, err
 		}
 		bytesWritten += n
+	}
+
+	// Close gzip writer before file (flushes compression buffer)
+	if gzipWriter != nil {
+		if closeErr := gzipWriter.Close(); closeErr != nil {
+			err = fmt.Errorf("failed to close gzip writer: %w", closeErr)
+			return bytesWritten, err
+		}
+	}
+
+	// Close file and check for errors (e.g., disk full during flush)
+	// This must happen before we report success or delete source files
+	if closeErr := outFile.Close(); closeErr != nil {
+		err = fmt.Errorf("failed to close output file %s: %w", outputPath, closeErr)
+		return bytesWritten, err
 	}
 
 	// Final callback
@@ -130,3 +162,4 @@ func appendFileToWriter(dst io.Writer, srcPath string) (int64, error) {
 	}
 	return n, nil
 }
+

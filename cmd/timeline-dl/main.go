@@ -28,10 +28,10 @@ var (
 func main() {
 	rootCmd := &cobra.Command{
 		Use:   "timeline-dl",
-		Short: "Download Microsoft Defender device timelines",
-		Long: `A CLI tool to download device timeline events from Microsoft Defender XDR.
+		Short: "Download Microsoft Defender device and identity timelines",
+		Long: `A CLI tool to download device and identity timeline events from Microsoft Defender XDR.
 
-Supports parallel processing of multiple devices with automatic token refresh
+Supports parallel processing of multiple devices and identities with automatic token refresh
 and rate limiting.`,
 		Version:       version,
 		RunE:          run,
@@ -65,22 +65,14 @@ func run(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to initialize logging: %w", err)
 		}
 		defer logging.Close()
-		logging.Info("Configuration loaded: %d devices, %d workers, from=%s to=%s",
-			len(cfg.Devices), cfg.Workers, cfg.FromDate.Format("2006-01-02"), cfg.ToDate.Format("2006-01-02"))
+		logging.Info("Configuration loaded: %d devices, %d identities, %d workers, from=%s to=%s",
+			len(cfg.Devices), len(cfg.Identities), cfg.Workers, cfg.FromDate.Format("2006-01-02"), cfg.ToDate.Format("2006-01-02"))
 	}
 
-	// Setup context with cancellation for signal handling
-	_, cancel := context.WithCancel(context.Background())
+	// Setup context with signal handling using NotifyContext.
+	// This eliminates race conditions between signal goroutine and main execution.
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-
-	// Handle signals
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		fmt.Println("\nReceived interrupt signal, shutting down...")
-		cancel()
-	}()
 
 	// Create shared HTTP client for connection pooling across all components
 	// This enables TCP Keep-Alive reuse and centralized timeout configuration
@@ -88,7 +80,7 @@ func run(cmd *cobra.Command, args []string) error {
 		Timeout: cfg.HTTPTimeout,
 		Transport: &http.Transport{
 			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 10,
+			MaxIdleConnsPerHost: 20,
 			IdleConnTimeout:     90 * time.Second,
 		},
 	}
@@ -110,8 +102,8 @@ func run(cmd *cobra.Command, args []string) error {
 	// Setup backoff
 	bo := backoff.New(cfg.GetBackoffConfig())
 
-	// Setup timeline options
-	timelineOpts := api.TimelineOptions{
+	// Setup device timeline options
+	deviceOpts := api.DeviceTimelineOptions{
 		GenerateIdentityEvents: cfg.GenerateIdentityEvents,
 		IncludeIdentityEvents:  cfg.IncludeIdentityEvents,
 		SupportMdiOnlyEvents:   cfg.SupportMdiOnlyEvents,
@@ -120,10 +112,10 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 
 	// Setup API client (shares HTTP client for connection pooling)
-	client := api.NewClient(httpClient, authenticator, bo, timelineOpts, cfg.MaxRetries)
+	client := api.NewClient(httpClient, authenticator, bo, cfg.MaxRetries)
 
 	// Setup file manager
-	fileManager, err := output.NewFileManager(cfg.OutputDir)
+	fileManager, err := output.NewFileManager(cfg.OutputDir, cfg.Gzip)
 	if err != nil {
 		return fmt.Errorf("failed to setup output directory: %w", err)
 	}
@@ -134,57 +126,74 @@ func run(cmd *cobra.Command, args []string) error {
 		devices[i] = api.NewDeviceInput(d)
 	}
 
-	// Setup worker pool (using pond library)
-	pool := worker.NewPool(worker.PoolConfig{
-		NumWorkers:  cfg.Workers,
-		Client:      client,
-		Backoff:     bo,
-		FileManager: fileManager,
-		FromDate:    cfg.FromDate,
-		ToDate:      cfg.ToDate,
-	})
-
-	// Generate jobs (with chunking if enabled)
-	var jobs []*worker.Job
+	// Generate jobs BEFORE creating pool (need totalExpectedResults for buffer sizing)
+	var jobs []worker.Job
 	jobID := 0
 	for _, device := range devices {
-		deviceJobs := worker.SplitIntoChunks(device, cfg.FromDate, cfg.ToDate, cfg.TimeChunkDays, jobID)
+		deviceJobs := worker.SplitIntoChunks(device, cfg.FromDate, cfg.ToDate, cfg.TimeChunk, jobID, deviceOpts)
 		jobs = append(jobs, deviceJobs...)
 		jobID += len(deviceJobs)
 	}
-
-	// Submit all jobs to the pool
-	for _, job := range jobs {
-		pool.Submit(job)
+	for _, identityStr := range cfg.Identities {
+		identity := api.NewIdentityInput(identityStr)
+		identityJobs := worker.SplitIdentityIntoChunks(identity, cfg.FromDate, cfg.ToDate, cfg.TimeChunk, jobID, cfg.PageSize)
+		jobs = append(jobs, identityJobs...)
+		jobID += len(identityJobs)
 	}
 
 	// Calculate total expected results:
 	// - One result per download job
-	// - One merge result per chunked device (sent by the worker that completes the last chunk)
-	chunkedDevices := make(map[string]bool)
+	// - One merge result per chunked entity (device or identity) (sent by the worker that completes the last chunk)
+	chunkedEntities := make(map[string]bool)
 	for _, job := range jobs {
-		if job.ChunkInfo != nil {
-			chunkedDevices[job.ChunkInfo.DeviceKey] = true
+		if chunkInfo := job.GetChunkInfo(); chunkInfo != nil {
+			chunkedEntities[chunkInfo.EntityKey] = true
 		}
 	}
-	totalExpectedResults := len(jobs) + len(chunkedDevices)
+	totalExpectedResults := len(jobs) + len(chunkedEntities)
+
+	// Setup worker pool (using pond library)
+	pool := worker.NewPool(worker.PoolConfig{
+		NumWorkers:           cfg.Workers,
+		Client:               client,
+		Backoff:              bo,
+		FileManager:          fileManager,
+		FromDate:             cfg.FromDate,
+		ToDate:               cfg.ToDate,
+		TenantID:             cfg.TenantID,
+		Context:              ctx,
+		TotalExpectedResults: totalExpectedResults,
+	})
+
+	// Submit all jobs to the pool
+	pool.SubmitAll(jobs)
 
 	// Check for simple mode
 	simpleMode, _ := cmd.Flags().GetBool("simple")
 
 	if simpleMode || !isTerminal() {
-		// Simple output mode
-		ui.RunSimple(totalExpectedResults, pool.Results())
+		go func() {
+			for range pool.StatusUpdates() {
+			}
+		}()
+		// Simple output mode - use ctx.Done() to detect cancellation
+		ui.RunSimple(totalExpectedResults, pool.Results(), ctx.Done())
 		pool.StopAndWait()
 	} else {
 		// Fancy UI mode
+		// onQuit triggers context cancellation when user quits via UI (pressing 'q')
+		onQuit := func() {
+			cancel()
+			pool.Stop()
+		}
+
 		app := ui.NewApp(
 			totalExpectedResults,
 			cfg.Workers,
 			pool.Results(),
 			pool.StatusUpdates(),
 			bo,
-			pool.Stop, // Stop pool immediately on ctrl+c
+			onQuit,
 		)
 
 		// Run UI (blocks until done)

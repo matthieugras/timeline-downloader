@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -17,26 +18,30 @@ import (
 
 // PoolConfig configures the worker pool
 type PoolConfig struct {
-	NumWorkers  int
-	Client      *api.Client
-	Backoff     *backoff.GlobalBackoff
-	FileManager *output.FileManager
-	FromDate    time.Time
-	ToDate      time.Time
+	NumWorkers           int
+	Client               *api.Client
+	Backoff              *backoff.GlobalBackoff
+	FileManager          *output.FileManager
+	FromDate             time.Time
+	ToDate               time.Time
+	TenantID             string          // Tenant ID for identity resolution
+	Context              context.Context // Parent context for cancellation
+	TotalExpectedResults int             // Size the results buffer to hold all results
 }
 
-// chunkTracker tracks chunk completion for a single device
+// chunkTracker tracks chunk completion for a single entity (device or identity)
 type chunkTracker struct {
-	hostname    string
-	machineID   string
+	entityType  EntityType
+	displayName string   // EntityDisplayName() - works for both Device and Identity
+	primaryKey  string   // PrimaryKey() - works for both Device and Identity
 	chunkFiles  []string // indexed by chunk index, empty string if failed
 	totalChunks int
 	completed   int // number of chunks completed (success or failure)
 }
 
-// deviceGroup tracks the state of all jobs for a single device.
-// If any chunk fails, the entire device group is cancelled.
-type deviceGroup struct {
+// entityGroup tracks the state of all jobs for a single entity.
+// If any chunk fails, the entire entity group is cancelled.
+type entityGroup struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	failed     bool   // true if any chunk failed
@@ -56,22 +61,29 @@ type Pool struct {
 	fileManager *output.FileManager
 	fromDate    time.Time
 	toDate      time.Time
+	tenantID    string
 
 	// Results channel
 	results chan JobResult
 
-	// Device cache - resolves device once per DeviceInput.Value, reuses for all chunks
-	deviceCacheMu   sync.RWMutex
-	deviceCache     map[string]*api.Device // keyed by DeviceInput.Value
-	deviceResolveGr singleflight.Group     // Deduplicates concurrent resolve requests
+	// Entity cache - resolves device/identity once per input value, reuses for all chunks
+	// Keys are prefixed: "device:hostname" or "identity:searchterm"
+	entityCacheMu   sync.RWMutex
+	entityCache     map[string]api.ResolvedEntity // *api.Device or *api.Identity
+	entityResolveGr singleflight.Group            // Deduplicates concurrent resolve requests
+
+	// Primary key deduplication - different search terms may resolve to the same entity
+	// Keys are primary keys: machineId for devices, radiusUserId for identities
+	seenPrimaryKeysMu sync.RWMutex
+	seenPrimaryKeys   map[string]string // primaryKey -> first entityKey that resolved to it
 
 	// Chunk tracking for automatic merging
 	chunkTrackersMu sync.Mutex
-	chunkTrackers   map[string]*chunkTracker // keyed by DeviceKey
+	chunkTrackers   map[string]*chunkTracker // keyed by entityKey
 
-	// Device group tracking - allows cancelling all chunks for a device on failure
-	deviceGroupsMu sync.Mutex
-	deviceGroups   map[string]*deviceGroup // keyed by DeviceInput.Value
+	// Entity group tracking - allows cancelling all chunks for an entity on failure
+	entityGroupsMu sync.Mutex
+	entityGroups   map[string]*entityGroup // keyed by entityKey
 
 	// Status tracking
 	statusMu      sync.RWMutex
@@ -85,7 +97,12 @@ type Pool struct {
 
 // NewPool creates a new worker pool using pond.
 func NewPool(cfg PoolConfig) *Pool {
-	ctx, cancel := context.WithCancel(context.Background())
+	// Use provided context or default to Background
+	parentCtx := cfg.Context
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parentCtx)
 
 	pondPool := pond.NewPool(cfg.NumWorkers)
 
@@ -96,19 +113,22 @@ func NewPool(cfg PoolConfig) *Pool {
 	}
 
 	p := &Pool{
-		pond:          pondPool,
-		numWorkers:    cfg.NumWorkers,
-		client:        cfg.Client,
-		backoff:       cfg.Backoff,
-		fileManager:   cfg.FileManager,
-		fromDate:      cfg.FromDate,
-		toDate:        cfg.ToDate,
-		results:       make(chan JobResult, cfg.NumWorkers*2),
-		deviceCache:   make(map[string]*api.Device),
-		chunkTrackers: make(map[string]*chunkTracker),
-		deviceGroups:  make(map[string]*deviceGroup),
-		workerStatus:  make(map[int]*WorkerStatus),
-		statusUpdates: make(chan WorkerStatus, cfg.NumWorkers*10),
+		pond:            pondPool,
+		numWorkers:      cfg.NumWorkers,
+		client:          cfg.Client,
+		backoff:         cfg.Backoff,
+		fileManager:     cfg.FileManager,
+		fromDate:        cfg.FromDate,
+		toDate:          cfg.ToDate,
+		tenantID:        cfg.TenantID,
+		results:         make(chan JobResult, cfg.TotalExpectedResults),
+		entityCache:     make(map[string]api.ResolvedEntity),
+		seenPrimaryKeys: make(map[string]string),
+		chunkTrackers:   make(map[string]*chunkTracker),
+		entityGroups:    make(map[string]*entityGroup),
+		workerStatus:    make(map[int]*WorkerStatus),
+		// Small buffer for status updates. Sends are blocking to ensure no updates are dropped.
+		statusUpdates: make(chan WorkerStatus, cfg.NumWorkers*2),
 		workerIDPool:  workerIDPool,
 		ctx:           ctx,
 		cancel:        cancel,
@@ -118,14 +138,14 @@ func NewPool(cfg PoolConfig) *Pool {
 }
 
 // Submit adds a job to the pool.
-func (p *Pool) Submit(job *Job) {
+func (p *Pool) Submit(job Job) {
 	p.pond.Submit(func() {
 		p.executeJob(job)
 	})
 }
 
 // executeJob processes a single job and sends results
-func (p *Pool) executeJob(job *Job) {
+func (p *Pool) executeJob(job Job) {
 	// Acquire a worker ID from the pool (blocks until one is available)
 	workerID := <-p.workerIDPool
 	defer func() {
@@ -133,51 +153,56 @@ func (p *Pool) executeJob(job *Job) {
 	}()
 
 	// Set initial status
-	p.updateStatusWithJob(workerID, WorkerStateWorking, job.DeviceInput.Value, job, 0, job.FromDate)
+	p.updateStatusWithJob(workerID, WorkerStateWorking, job.EntityDisplayName(), job, 0, job.InitialStatusDate())
 	defer p.updateStatusWithJob(workerID, WorkerStateIdle, "", nil, 0, time.Time{})
 
-	result := p.processJob(workerID, job)
+	result := p.processDownloadJob(workerID, job)
 
-	// Send result
-	select {
-	case p.results <- result:
-	case <-p.ctx.Done():
-		return
-	}
+	// Send result (channel is sized to hold all results, so this never blocks)
+	p.results <- result
 
-	// If this was a chunked job that succeeded, check if we should merge
-	if job.ChunkInfo != nil {
-		mergeResult := p.trackChunkAndMaybemerge(workerID, job, &result)
+	// If this was a chunked job, track completion and merge when all chunks are done.
+	// This is called for both success and failure to ensure cleanup happens.
+	chunkInfo := job.GetChunkInfo()
+	if chunkInfo != nil {
+		mergeResult := p.trackChunkAndMaybeMerge(workerID, job, &result)
 		if mergeResult != nil {
-			select {
-			case p.results <- *mergeResult:
-			case <-p.ctx.Done():
-			}
+			p.results <- *mergeResult
 		}
 	}
 }
 
-// trackChunkAndMaybemerge tracks chunk completion and performs merge if this was the last chunk.
+// trackChunkAndMaybeMerge tracks chunk completion and performs merge if this was the last chunk.
 // Returns a merge result if merge was performed, nil otherwise.
-func (p *Pool) trackChunkAndMaybemerge(workerID int, job *Job, result *JobResult) *JobResult {
-	key := job.ChunkInfo.DeviceKey
+func (p *Pool) trackChunkAndMaybeMerge(workerID int, job Job, result *JobResult) *JobResult {
+	chunkInfo := job.GetChunkInfo()
+	key := chunkInfo.EntityKey
 
 	p.chunkTrackersMu.Lock()
 
 	tracker, exists := p.chunkTrackers[key]
 	if !exists {
 		tracker = &chunkTracker{
-			chunkFiles:  make([]string, job.ChunkInfo.TotalChunks),
-			totalChunks: job.ChunkInfo.TotalChunks,
+			entityType:  job.EntityType(),
+			chunkFiles:  make([]string, chunkInfo.TotalChunks),
+			totalChunks: chunkInfo.TotalChunks,
 		}
 		p.chunkTrackers[key] = tracker
 	}
 
 	// Record this chunk's result
-	if result.Error == nil && result.Device != nil {
-		tracker.hostname = result.Device.ComputerDNSName
-		tracker.machineID = result.Device.MachineID
-		tracker.chunkFiles[job.ChunkInfo.ChunkIndex] = result.OutputFile
+	if result.Error == nil {
+		chunkIdx := chunkInfo.ChunkIndex
+		// Bounds check to prevent panic if ChunkIndex is invalid
+		if chunkIdx < 0 || chunkIdx >= len(tracker.chunkFiles) {
+			p.chunkTrackersMu.Unlock()
+			logging.Error("Invalid chunk index %d for entity %s (expected 0-%d)",
+				chunkIdx, key, len(tracker.chunkFiles)-1)
+			return nil
+		}
+		tracker.displayName = result.Entity.EntityDisplayName()
+		tracker.primaryKey = result.Entity.PrimaryKey()
+		tracker.chunkFiles[chunkIdx] = result.OutputFile
 	}
 	tracker.completed++
 
@@ -189,18 +214,40 @@ func (p *Pool) trackChunkAndMaybemerge(workerID int, job *Job, result *JobResult
 	}
 
 	// This is the last chunk - copy data and release lock before merging
-	hostname := tracker.hostname
-	machineID := tracker.machineID
+	entityType := tracker.entityType
+	displayName := tracker.displayName
+	primaryKey := tracker.primaryKey
 	chunkFiles := make([]string, len(tracker.chunkFiles))
 	copy(chunkFiles, tracker.chunkFiles)
+	entityKey := job.EntityKey()
 
 	// Clean up tracker
 	delete(p.chunkTrackers, key)
 	p.chunkTrackersMu.Unlock()
 
-	// Don't merge if we don't have hostname (all chunks failed)
-	if hostname == "" {
-		return nil
+	// Clean up device group (no longer needed after last chunk)
+	p.cleanupEntityGroup(entityKey)
+
+	// Helper to create a skipped merge result - used when no merge is needed
+	// but we must still send a result so the UI doesn't hang waiting for it
+	createSkippedMergeResult := func(reason string) *JobResult {
+		return &JobResult{
+			MergeJob: &MergeJob{
+				ID:     -1,
+				Type:   JobTypeMerge,
+				Entity: entityType,
+				MergeInfo: &MergeInfo{
+					Hostname: displayName,
+				},
+			},
+			Skipped:       true,
+			SkippedReason: reason,
+		}
+	}
+
+	// Don't merge if we don't have entity info (all chunks failed before resolution)
+	if displayName == "" {
+		return createSkippedMergeResult("all chunks failed before entity resolution")
 	}
 
 	// Collect valid chunk files
@@ -211,21 +258,23 @@ func (p *Pool) trackChunkAndMaybemerge(workerID int, job *Job, result *JobResult
 		}
 	}
 
+	// If no valid files (all chunks were skipped, e.g., duplicate entity), return skipped result
 	if len(validFiles) == 0 {
-		return nil
+		return createSkippedMergeResult("all chunks skipped (duplicate entity)")
 	}
 
 	// Check for partial completion - abort if some chunks failed
 	if len(validFiles) != len(chunkFiles) {
 		failedCount := len(chunkFiles) - len(validFiles)
 		logging.Error("Partial merge aborted for %s: %d/%d chunks failed",
-			hostname, failedCount, len(chunkFiles))
+			displayName, failedCount, len(chunkFiles))
 		return &JobResult{
-			Job: &Job{
-				ID:   -1,
-				Type: JobTypeMerge,
+			MergeJob: &MergeJob{
+				ID:     -1,
+				Type:   JobTypeMerge,
+				Entity: entityType,
 				MergeInfo: &MergeInfo{
-					Hostname: hostname,
+					Hostname: displayName,
 				},
 			},
 			Error: fmt.Errorf("merge aborted: %d/%d chunks failed", failedCount, len(chunkFiles)),
@@ -233,63 +282,77 @@ func (p *Pool) trackChunkAndMaybemerge(workerID int, job *Job, result *JobResult
 	}
 
 	// Perform merge
-	return p.performMerge(workerID, hostname, machineID, validFiles)
+	return p.performMerge(workerID, entityType, displayName, primaryKey, validFiles)
 }
 
-// performMerge merges chunk files into the final output file
-func (p *Pool) performMerge(workerID int, hostname, machineID string, chunkFiles []string) *JobResult {
+// performMerge merges chunk files into the final output file.
+// For identity timelines, chunk files are reversed before merging because
+// identity events are returned in descending order (newest first).
+func (p *Pool) performMerge(workerID int, entityType EntityType, displayName, primaryKey string, chunkFiles []string) *JobResult {
 	start := time.Now()
 
-	outputPath := p.fileManager.GetFinalPath(hostname, machineID)
-	totalBytes, _ := output.CalculateTotalBytes(chunkFiles)
+	// For identity timelines, reverse chunk order (events are descending, so latest chunk first)
+	filesToMerge := chunkFiles
+	if entityType == EntityTypeIdentity {
+		filesToMerge = make([]string, len(chunkFiles))
+		for i, f := range chunkFiles {
+			filesToMerge[len(chunkFiles)-1-i] = f
+		}
+	}
 
-	logging.Info("Starting merge for %s: %d chunk files -> %s", hostname, len(chunkFiles), outputPath)
+	isIdentity := entityType == EntityTypeIdentity
+	outputPath := p.fileManager.GetFinalPath(displayName, primaryKey, isIdentity)
+	totalBytes, _ := output.CalculateTotalBytes(filesToMerge)
+
+	logging.Info("Starting merge for %s: %d chunk files -> %s", displayName, len(filesToMerge), outputPath)
 
 	// Update status to merging
-	p.updateMergeStatus(workerID, hostname, 0, totalBytes)
+	p.updateMergeStatus(workerID, displayName, 0, totalBytes)
 
 	// Progress callback
 	progressCallback := func(bytesCopied, total int64) {
-		p.updateMergeStatus(workerID, hostname, bytesCopied, total)
+		p.updateMergeStatus(workerID, displayName, bytesCopied, total)
 	}
 
 	bytesWritten, err := output.MergeChunkFilesWithProgress(
-		chunkFiles,
+		filesToMerge,
 		outputPath,
 		true, // deleteChunks
+		p.fileManager.Gzip(),
 		progressCallback,
 	)
 
 	// Create merge job for the result
-	mergeJob := &Job{
-		ID:   -1, // Merge jobs don't have IDs in this model
-		Type: JobTypeMerge,
+	mergeJob := &MergeJob{
+		ID:     -1, // Merge jobs don't have IDs in this model
+		Type:   JobTypeMerge,
+		Entity: entityType,
 		MergeInfo: &MergeInfo{
-			ChunkFiles: chunkFiles,
+			ChunkFiles: filesToMerge,
 			OutputPath: outputPath,
 			TotalBytes: totalBytes,
-			Hostname:   hostname,
+			Hostname:   displayName,
 		},
 	}
 
 	result := JobResult{
-		Job:        mergeJob,
+		MergeJob:   mergeJob,
 		OutputFile: outputPath,
 		Duration:   time.Since(start),
 	}
 
 	if err != nil {
 		result.Error = fmt.Errorf("merge failed: %w", err)
-		logging.Error("Merge failed for %s: %v", hostname, err)
+		logging.Error("Merge failed for %s: %v", displayName, err)
 	} else {
-		logging.Info("Merged %s: %d bytes written to %s", hostname, bytesWritten, outputPath)
+		logging.Info("Merged %s: %d bytes written to %s", displayName, bytesWritten, outputPath)
 	}
 
 	return &result
 }
 
 // SubmitAll submits multiple jobs
-func (p *Pool) SubmitAll(jobs []*Job) {
+func (p *Pool) SubmitAll(jobs []Job) {
 	for _, job := range jobs {
 		p.Submit(job)
 	}
@@ -303,6 +366,12 @@ func (p *Pool) Results() <-chan JobResult {
 // StatusUpdates returns channel of worker status updates
 func (p *Pool) StatusUpdates() <-chan WorkerStatus {
 	return p.statusUpdates
+}
+
+// Done returns a channel that is closed when the pool's context is cancelled.
+// Use this to detect shutdown (e.g., fatal error or interrupt).
+func (p *Pool) Done() <-chan struct{} {
+	return p.ctx.Done()
 }
 
 // GetWorkerStatus returns the current status of all workers
@@ -331,33 +400,33 @@ func (p *Pool) Stop() {
 	p.pond.Stop()
 }
 
-// getOrCreateDeviceGroup returns the device group for the given device key,
+// getOrCreateEntityGroup returns the device group for the given device key,
 // creating one if it doesn't exist.
-func (p *Pool) getOrCreateDeviceGroup(deviceKey string) *deviceGroup {
-	p.deviceGroupsMu.Lock()
-	defer p.deviceGroupsMu.Unlock()
+func (p *Pool) getOrCreateEntityGroup(entityKey string) *entityGroup {
+	p.entityGroupsMu.Lock()
+	defer p.entityGroupsMu.Unlock()
 
-	if group, exists := p.deviceGroups[deviceKey]; exists {
+	if group, exists := p.entityGroups[entityKey]; exists {
 		return group
 	}
 
 	// Create new device group with a cancellable context derived from the pool context
 	ctx, cancel := context.WithCancel(p.ctx)
-	group := &deviceGroup{
+	group := &entityGroup{
 		ctx:    ctx,
 		cancel: cancel,
 	}
-	p.deviceGroups[deviceKey] = group
+	p.entityGroups[entityKey] = group
 	return group
 }
 
-// markDeviceFailed marks a device as failed and cancels all pending jobs for it.
+// markEntityFailed marks a device as failed and cancels all pending jobs for it.
 // Returns true if this call marked it as failed (first failure), false if already failed.
-func (p *Pool) markDeviceFailed(deviceKey string, reason string) bool {
-	p.deviceGroupsMu.Lock()
-	defer p.deviceGroupsMu.Unlock()
+func (p *Pool) markEntityFailed(entityKey string, reason string) bool {
+	p.entityGroupsMu.Lock()
+	defer p.entityGroupsMu.Unlock()
 
-	group, exists := p.deviceGroups[deviceKey]
+	group, exists := p.entityGroups[entityKey]
 	if !exists {
 		return false
 	}
@@ -370,26 +439,62 @@ func (p *Pool) markDeviceFailed(deviceKey string, reason string) bool {
 	group.failReason = reason
 	group.cancel() // Cancel the context to abort in-flight requests
 
-	logging.Error("Device %s: all processing cancelled due to error: %s", deviceKey, reason)
+	logging.Error("Entity %s: all processing cancelled due to error: %s", entityKey, reason)
 	return true
 }
 
-// isDeviceFailed checks if the device has been marked as failed.
-func (p *Pool) isDeviceFailed(deviceKey string) (bool, string) {
-	p.deviceGroupsMu.Lock()
-	defer p.deviceGroupsMu.Unlock()
+// isEntityFailed checks if the device has been marked as failed.
+func (p *Pool) isEntityFailed(entityKey string) (bool, string) {
+	p.entityGroupsMu.Lock()
+	defer p.entityGroupsMu.Unlock()
 
-	if group, exists := p.deviceGroups[deviceKey]; exists && group.failed {
+	if group, exists := p.entityGroups[entityKey]; exists && group.failed {
 		return true, group.failReason
 	}
 	return false, ""
 }
 
-func (p *Pool) updateStatusWithJob(id int, state WorkerState, device string, job *Job, progress int, currentDate time.Time) {
+// cleanupEntityGroup removes a entity group entry and associated cache entries
+// after all processing is complete. This prevents unbounded memory growth.
+func (p *Pool) cleanupEntityGroup(entityKey string) {
+	// Clean up entity group
+	p.entityGroupsMu.Lock()
+	if group, exists := p.entityGroups[entityKey]; exists {
+		// Cancel context to release resources (no-op if already cancelled)
+		group.cancel()
+		delete(p.entityGroups, entityKey)
+	}
+	p.entityGroupsMu.Unlock()
+
+	// Clean up chunk tracker (uses entityKey as key since chunker.go prefixes keys)
+	p.chunkTrackersMu.Lock()
+	delete(p.chunkTrackers, entityKey)
+	p.chunkTrackersMu.Unlock()
+
+	// Clean up entity cache and primary key tracking
+	p.entityCacheMu.Lock()
+	if entity, exists := p.entityCache[entityKey]; exists {
+		// Get primary key before deleting from cache
+		primaryKey := entity.PrimaryKey()
+		delete(p.entityCache, entityKey)
+
+		// Clean up seenPrimaryKeys if this entityKey registered it
+		if primaryKey != "" {
+			p.seenPrimaryKeysMu.Lock()
+			if registeredBy, ok := p.seenPrimaryKeys[primaryKey]; ok && registeredBy == entityKey {
+				delete(p.seenPrimaryKeys, primaryKey)
+			}
+			p.seenPrimaryKeysMu.Unlock()
+		}
+	}
+	p.entityCacheMu.Unlock()
+}
+
+func (p *Pool) updateStatusWithJob(id int, state WorkerState, entity string, job Job, progress int, currentDate time.Time) {
 	status := WorkerStatus{
 		ID:            id,
 		State:         state,
-		CurrentDevice: device,
+		CurrentEntity: entity,
 		Progress:      progress,
 		CurrentDate:   currentDate,
 		FromDate:      p.fromDate,
@@ -397,54 +502,124 @@ func (p *Pool) updateStatusWithJob(id int, state WorkerState, device string, job
 	}
 
 	if job != nil {
-		status.JobID = job.ID
-		status.FromDate = job.FromDate
-		status.ToDate = job.ToDate
-		if job.ChunkInfo != nil {
-			status.ChunkLabel = job.ChunkInfo.ChunkLabel()
+		status.JobID = job.JobID()
+		status.FromDate = job.FromDate()
+		status.ToDate = job.ToDate()
+		if chunkInfo := job.GetChunkInfo(); chunkInfo != nil {
+			status.ChunkLabel = chunkInfo.ChunkLabel()
 		}
+		// Identity timelines process newest→oldest (reverse progress)
+		status.ReverseProgress = job.IsIdentity()
 	}
 
 	p.statusMu.Lock()
 	p.workerStatus[id] = &status
 	p.statusMu.Unlock()
 
-	// Non-blocking send to status updates channel
+	// Blocking send to ensure UI receives all status updates.
+	// Context check prevents blocking forever during shutdown.
 	select {
 	case p.statusUpdates <- status:
-	default:
+	case <-p.ctx.Done():
 	}
 }
 
 // checkAndUpdateBackoffState updates worker state based on current backoff status.
 // This ensures workers show "backing off" state even during active downloads.
-func (p *Pool) checkAndUpdateBackoffState(workerID int, device string, job *Job, progress int, currentDate time.Time) {
+func (p *Pool) checkAndUpdateBackoffState(workerID int, entity string, job Job, progress int, currentDate time.Time) {
 	if p.backoff.IsBackingOff() {
-		p.updateStatusWithJob(workerID, WorkerStateBackingOff, device, job, progress, currentDate)
+		p.updateStatusWithJob(workerID, WorkerStateBackingOff, entity, job, progress, currentDate)
 	} else {
-		p.updateStatusWithJob(workerID, WorkerStateWorking, device, job, progress, currentDate)
+		p.updateStatusWithJob(workerID, WorkerStateWorking, entity, job, progress, currentDate)
 	}
 }
 
-func (p *Pool) processJob(workerID int, job *Job) JobResult {
+// handleJobError handles errors from job processing, determining if the error is fatal
+// (stops entire pool) or entity-specific (cancels only this entity's jobs).
+// Returns true if the result.Fatal flag was set.
+// If skipCancelled is true, context.Canceled errors won't mark the entity as failed.
+func (p *Pool) handleJobError(result *JobResult, err error, entityKey string, skipCancelled bool) bool {
+	var apiErr *api.APIError
+	if errors.As(err, &apiErr) && apiErr.Fatal {
+		result.Fatal = true
+		logging.Error("Fatal error encountered, stopping all jobs")
+		p.cancel() // Stop the pool
+		return true
+	}
+
+	// Don't mark as failed for cancellation (unless skipCancelled is false)
+	if skipCancelled && errors.Is(err, context.Canceled) {
+		return false
+	}
+
+	// Non-fatal error - cancel only this entity's jobs
+	p.markEntityFailed(entityKey, err.Error())
+	return false
+}
+
+// getOrResolveEntity returns a cached entity or resolves it via the job.
+// Uses singleflight to deduplicate concurrent requests for the same entity.
+func (p *Pool) getOrResolveEntity(ctx context.Context, job Job) (api.ResolvedEntity, error) {
+	cacheKey := job.EntityKey()
+
+	// Check cache first (read lock)
+	p.entityCacheMu.RLock()
+	if cached, ok := p.entityCache[cacheKey]; ok {
+		p.entityCacheMu.RUnlock()
+		job.LogCachedEntity(cached)
+		return cached, nil
+	}
+	p.entityCacheMu.RUnlock()
+
+	// Use singleflight to deduplicate concurrent resolution requests
+	result, err, _ := p.entityResolveGr.Do(cacheKey, func() (any, error) {
+		// Double-check cache inside singleflight
+		p.entityCacheMu.RLock()
+		if cached, ok := p.entityCache[cacheKey]; ok {
+			p.entityCacheMu.RUnlock()
+			return cached, nil
+		}
+		p.entityCacheMu.RUnlock()
+
+		// Resolve entity
+		logging.Info("Resolving %s: %s", job.TypeName(), job.InputValue())
+		entity, err := job.ResolveEntity(ctx, p.client, p.tenantID)
+		if err != nil {
+			return nil, err
+		}
+		job.LogResolvedEntity(entity)
+
+		// Store in cache
+		p.entityCacheMu.Lock()
+		p.entityCache[cacheKey] = entity
+		p.entityCacheMu.Unlock()
+
+		return entity, nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+	return result.(api.ResolvedEntity), nil
+}
+
+// processDownloadJob processes a download job for any entity type.
+func (p *Pool) processDownloadJob(workerID int, job Job) JobResult {
 	start := time.Now()
 	result := JobResult{Job: job}
-	deviceKey := job.DeviceInput.Value
+	entityKey := job.EntityKey()
 
-	// Get or create device group for cancellation support
-	group := p.getOrCreateDeviceGroup(deviceKey)
+	// Get or create entity group for cancellation support
+	group := p.getOrCreateEntityGroup(entityKey)
 
-	// Check if device has already failed (another chunk encountered an error)
-	if failed, reason := p.isDeviceFailed(deviceKey); failed {
-		result.Error = fmt.Errorf("skipped: device processing cancelled due to earlier error: %s", reason)
+	// Check if entity has already failed
+	if failed, reason := p.isEntityFailed(entityKey); failed {
+		result.Error = fmt.Errorf("skipped: %s processing cancelled due to earlier error: %s", job.TypeName(), reason)
 		result.Duration = time.Since(start)
 		return result
 	}
 
-	// Use the device group's context (cancelled if any chunk for this device fails)
 	ctx := group.ctx
-
-	// Check context
 	if ctx.Err() != nil {
 		result.Error = ctx.Err()
 		result.Duration = time.Since(start)
@@ -453,117 +628,110 @@ func (p *Pool) processJob(workerID int, job *Job) JobResult {
 
 	// Wait if backoff is active
 	if p.backoff.IsBackingOff() {
-		p.updateStatusWithJob(workerID, WorkerStateBackingOff, job.DeviceInput.Value, job, 0, job.FromDate)
+		p.updateStatusWithJob(workerID, WorkerStateBackingOff, job.InputValue(), job, 0, job.InitialStatusDate())
 		if err := p.backoff.WaitIfNeeded(ctx); err != nil {
 			result.Error = err
 			result.Duration = time.Since(start)
 			return result
 		}
-		p.updateStatusWithJob(workerID, WorkerStateWorking, job.DeviceInput.Value, job, 0, job.FromDate)
+		p.updateStatusWithJob(workerID, WorkerStateWorking, job.InputValue(), job, 0, job.InitialStatusDate())
 	}
 
-	// Step 1: Resolve device (use cache to avoid redundant API calls for chunked jobs)
-	device, err := p.getOrResolveDevice(ctx, job.DeviceInput)
+	// Resolve entity
+	entity, err := p.getOrResolveEntity(ctx, job)
 	if err != nil {
-		result.Error = fmt.Errorf("device resolution failed: %w", err)
-		logging.Error("Device resolution failed for %s: %v", job.DeviceInput.Value, err)
+		result.Error = fmt.Errorf("%s resolution failed: %w", job.TypeName(), err)
+		logging.Error("%s resolution failed for %s: %v", job.TypeNameTitle(), job.InputValue(), err)
 		result.Duration = time.Since(start)
-
-		// Check if this is a fatal error (e.g., auth failure) - stop entire pool
-		var apiErr *api.APIError
-		if errors.As(err, &apiErr) && apiErr.Fatal {
-			result.Fatal = true
-			logging.Error("Fatal error encountered, stopping all jobs")
-			p.cancel() // Stop the pool
-		} else {
-			// Non-fatal error - cancel only this device's jobs
-			p.markDeviceFailed(deviceKey, err.Error())
-		}
+		p.handleJobError(&result, err, entityKey, false)
 		return result
 	}
-	result.Device = device
+	result.Entity = entity
 
-	// Update status to show resolved DNS name instead of input value
-	p.updateStatusWithJob(workerID, WorkerStateWorking, device.ComputerDNSName, job, 0, job.FromDate)
+	displayName := entity.EntityDisplayName()
 
-	// Step 2: Get writer for this device (with built-in date filtering)
+	// Check for duplicate primary key
+	if originalKey, isNew := p.checkAndRegisterPrimaryKey(entity.PrimaryKey(), entityKey); !isNew {
+		reason := fmt.Sprintf("duplicate: %s %s already processed via %s", job.PrimaryKeyLabel(), entity.PrimaryKey(), originalKey)
+		logging.Info("Skipping %s %s: %s", job.TypeName(), job.InputValue(), reason)
+		result.Skipped = true
+		result.SkippedReason = reason
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	p.updateStatusWithJob(workerID, WorkerStateWorking, displayName, job, 0, job.InitialStatusDate())
+
+	// Get writer
 	var writer *output.JSONLWriter
 	var outputPath string
+	fromDate, toDate := job.WriterDates()
+	chunkInfo := job.GetChunkInfo()
 
-	if job.ChunkInfo != nil {
-		// Chunked job: use chunk file
+	if chunkInfo != nil {
 		writer, outputPath, err = p.fileManager.GetChunkWriter(
-			device.ComputerDNSName,
-			device.MachineID,
-			job.ChunkInfo.ChunkIndex,
-			job.FromDate,
-			job.ToDate,
+			displayName, entity.PrimaryKey(), chunkInfo.ChunkIndex,
+			fromDate, toDate, job.IsIdentity(),
 		)
 		if err != nil {
 			result.Error = fmt.Errorf("failed to create chunk file: %w", err)
-			logging.Error("Failed to create chunk file for %s: %v", device.ComputerDNSName, err)
+			logging.Error("Failed to create chunk file for %s: %v", displayName, err)
 			result.Duration = time.Since(start)
-			p.markDeviceFailed(deviceKey, err.Error())
+			p.markEntityFailed(entityKey, err.Error())
 			return result
 		}
-		logging.Info("Chunk file: %s (chunk %d/%d)", outputPath, job.ChunkInfo.ChunkIndex+1, job.ChunkInfo.TotalChunks)
+		logging.Info("Chunk file: %s (chunk %d/%d)", outputPath, chunkInfo.ChunkIndex+1, chunkInfo.TotalChunks)
 	} else {
-		// Regular job: use normal file
-		writer, outputPath, err = p.fileManager.GetWriter(device.ComputerDNSName, device.MachineID, job.FromDate, job.ToDate)
+		writer, outputPath, err = p.fileManager.GetWriter(displayName, entity.PrimaryKey(), fromDate, toDate, job.IsIdentity())
 		if err != nil {
 			result.Error = fmt.Errorf("failed to create output file: %w", err)
-			logging.Error("Failed to create output file for %s: %v", device.ComputerDNSName, err)
+			logging.Error("Failed to create output file for %s: %v", displayName, err)
 			result.Duration = time.Since(start)
-			p.markDeviceFailed(deviceKey, err.Error())
+			p.markEntityFailed(entityKey, err.Error())
 			return result
 		}
 		logging.Info("Output file: %s", outputPath)
 	}
 	result.OutputFile = outputPath
 
-	// Ensure writer is closed when done (flushes buffers)
+	var ctxCancelledBeforeCleanup bool
 	defer func() {
 		if err := writer.Close(); err != nil {
-			logging.Error("Failed to close writer for %s: %v", device.ComputerDNSName, err)
+			logging.Error("Failed to close writer for %s: %v", displayName, err)
+		}
+		if ctxCancelledBeforeCleanup {
+			if err := os.Remove(outputPath); err == nil {
+				logging.Debug("Cleaned up partial file on cancellation: %s", outputPath)
+			}
 		}
 	}()
 
-	// Step 3: Download timeline with progress callback
-	logging.Info("Downloading timeline for %s from %s to %s",
-		device.ComputerDNSName, job.FromDate.Format("2006-01-02"), job.ToDate.Format("2006-01-02"))
+	// Download timeline
+	logging.Info("Downloading %s timeline for %s from %s to %s",
+		job.TypeName(), displayName, job.FromDate().Format("2006-01-02"), job.ToDate().Format("2006-01-02"))
 	progressCallback := func(eventCount int, currentDate time.Time) {
-		p.checkAndUpdateBackoffState(workerID, device.ComputerDNSName, job, eventCount, currentDate)
+		p.checkAndUpdateBackoffState(workerID, displayName, job, eventCount, currentDate)
 	}
 
-	eventCount, err := p.client.DownloadTimeline(
-		ctx,
-		device,
-		job.FromDate,
-		job.ToDate,
-		writer,
-		progressCallback,
-	)
+	eventCount, err := job.DownloadTimeline(ctx, p.client, entity, writer, progressCallback)
 	if err != nil {
-		result.Error = fmt.Errorf("timeline download failed: %w", err)
-		logging.Error("Timeline download failed for %s: %v", device.ComputerDNSName, err)
+		result.Error = fmt.Errorf("%s timeline download failed: %w", job.TypeName(), err)
+		logging.Error("%s timeline download failed for %s: %v", job.TypeNameTitle(), displayName, err)
 		result.Duration = time.Since(start)
-
-		// Check if this is a fatal error (e.g., auth failure) - stop entire pool
-		var apiErr *api.APIError
-		if errors.As(err, &apiErr) && apiErr.Fatal {
-			result.Fatal = true
-			logging.Error("Fatal error encountered, stopping all jobs")
-			p.cancel() // Stop the pool
-		} else if !errors.Is(err, context.Canceled) {
-			// Non-fatal, non-cancellation error - cancel only this device's jobs
-			p.markDeviceFailed(deviceKey, err.Error())
-		}
+		ctxCancelledBeforeCleanup = ctx.Err() != nil
+		p.handleJobError(&result, err, entityKey, true)
 		return result
 	}
-	logging.Info("Downloaded %d events for %s", eventCount, device.ComputerDNSName)
+	logging.Info("Downloaded %d events for %s", eventCount, displayName)
 
 	result.EventCount = eventCount
 	result.Duration = time.Since(start)
+	ctxCancelledBeforeCleanup = ctx.Err() != nil
+
+	if chunkInfo == nil {
+		p.cleanupEntityGroup(entityKey)
+	}
+
 	return result
 }
 
@@ -571,7 +739,7 @@ func (p *Pool) updateMergeStatus(id int, hostname string, bytesCopied, totalByte
 	status := WorkerStatus{
 		ID:            id,
 		State:         WorkerStateMerging,
-		CurrentDevice: hostname,
+		CurrentEntity: hostname,
 		BytesCopied:   bytesCopied,
 		TotalBytes:    totalBytes,
 	}
@@ -580,56 +748,37 @@ func (p *Pool) updateMergeStatus(id int, hostname string, bytesCopied, totalByte
 	p.workerStatus[id] = &status
 	p.statusMu.Unlock()
 
-	// Non-blocking send to status updates channel
+	// Blocking send to ensure UI receives all status updates.
+	// Context check prevents blocking forever during shutdown.
 	select {
 	case p.statusUpdates <- status:
-	default:
+	case <-p.ctx.Done():
 	}
 }
 
-// getOrResolveDevice returns a cached device or resolves it via API.
-// Uses singleflight to deduplicate concurrent requests for the same device.
-func (p *Pool) getOrResolveDevice(ctx context.Context, input api.DeviceInput) (*api.Device, error) {
-	key := input.Value
-
-	// Check cache first (read lock)
-	p.deviceCacheMu.RLock()
-	if device, ok := p.deviceCache[key]; ok {
-		p.deviceCacheMu.RUnlock()
-		logging.Info("Using cached device: %s (MachineID: %s)", device.ComputerDNSName, device.MachineID)
-		return device, nil
+// checkAndRegisterPrimaryKey checks if an entity's primary key has already been seen
+// by a DIFFERENT entity key (different search term resolving to same entity).
+// If not seen or seen by the same entityKey, it registers and returns ("", true).
+// If already seen by a different entityKey, it returns (originalEntityKey, false).
+func (p *Pool) checkAndRegisterPrimaryKey(primaryKey, entityKey string) (string, bool) {
+	if primaryKey == "" {
+		// No primary key available, allow processing
+		return "", true
 	}
-	p.deviceCacheMu.RUnlock()
 
-	// Use singleflight to deduplicate concurrent resolution requests
-	result, err, _ := p.deviceResolveGr.Do(key, func() (any, error) {
-		// Double-check cache inside singleflight (another request may have just completed)
-		p.deviceCacheMu.RLock()
-		if device, ok := p.deviceCache[key]; ok {
-			p.deviceCacheMu.RUnlock()
-			return device, nil
+	p.seenPrimaryKeysMu.Lock()
+	defer p.seenPrimaryKeysMu.Unlock()
+
+	if originalKey, exists := p.seenPrimaryKeys[primaryKey]; exists {
+		// If the same entityKey registered this primary key, allow processing
+		// (this handles chunked jobs where multiple chunks share the same entityKey)
+		if originalKey == entityKey {
+			return "", true
 		}
-		p.deviceCacheMu.RUnlock()
-
-		// Resolve device
-		logging.Info("Resolving device: %s", input.Value)
-		device, err := p.client.ResolveDevice(ctx, input)
-		if err != nil {
-			return nil, err
-		}
-		logging.Info("Resolved device %s -> MachineID: %s, SenseVersion: %s",
-			device.ComputerDNSName, device.MachineID, device.SenseClientVersion)
-
-		// Store in cache
-		p.deviceCacheMu.Lock()
-		p.deviceCache[key] = device
-		p.deviceCacheMu.Unlock()
-
-		return device, nil
-	})
-
-	if err != nil {
-		return nil, err
+		// Different entityKey resolved to the same primary key - this is a duplicate
+		return originalKey, false
 	}
-	return result.(*api.Device), nil
+
+	p.seenPrimaryKeys[primaryKey] = entityKey
+	return "", true
 }

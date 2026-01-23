@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/karrick/tparse/v2"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
@@ -20,9 +21,13 @@ type Config struct {
 	RefreshToken string `mapstructure:"refresh-token"`
 	ESTSCookie   string `mapstructure:"ests-cookie"` // ESTSAUTHPERSISTENT cookie value
 
-	// Input
+	// Input - Devices
 	Devices    []string `mapstructure:"devices"`
 	DeviceFile string   `mapstructure:"file"`
+
+	// Input - Identities
+	Identities   []string `mapstructure:"identities"`
+	IdentityFile string   `mapstructure:"identity-file"`
 
 	// Time range
 	FromDate time.Time
@@ -30,11 +35,13 @@ type Config struct {
 	Days     int `mapstructure:"days"`
 
 	// Processing
-	Workers       int `mapstructure:"workers"`
-	TimeChunkDays int `mapstructure:"timechunk"`
+	Workers   int           `mapstructure:"workers"`
+	TimeChunk time.Duration `mapstructure:"-"` // Parsed manually via tparse (not by viper)
+	NoChunk   bool          `mapstructure:"no-chunk"` // Disable chunking entirely
 
 	// Output
 	OutputDir string `mapstructure:"output"`
+	Gzip      bool   `mapstructure:"gzip"`
 
 	// Backoff
 	BackoffInitial time.Duration `mapstructure:"backoff-initial"`
@@ -86,9 +93,13 @@ func SetupFlags(cmd *cobra.Command) {
 	cmd.Flags().String("refresh-token", "", "OAuth refresh token (or set MDE_REFRESH_TOKEN env var)")
 	cmd.Flags().String("ests-cookie", "", "ESTSAUTHPERSISTENT cookie value (or set MDE_ESTS_COOKIE env var)")
 
-	// Input flags
+	// Input flags - Devices
 	cmd.Flags().StringSliceP("devices", "d", nil, "Comma-separated list of hostnames or machine IDs (auto-detected)")
 	cmd.Flags().StringP("file", "f", "", "File containing hostnames/machine IDs (one per line)")
+
+	// Input flags - Identities
+	cmd.Flags().StringSlice("identities", nil, "Comma-separated list of identity search terms (usernames, UPNs)")
+	cmd.Flags().String("identity-file", "", "File containing identity search terms (one per line)")
 
 	// Time range flags
 	cmd.Flags().String("from", "", "Start date (RFC3339 format, e.g., 2025-12-01T00:00:00Z)")
@@ -97,10 +108,12 @@ func SetupFlags(cmd *cobra.Command) {
 
 	// Processing flags
 	cmd.Flags().IntP("workers", "w", 5, "Number of parallel workers")
-	cmd.Flags().Int("timechunk", 0, "Split device downloads into N-day chunks for parallel processing (0=disabled)")
+	cmd.Flags().String("timechunk", "2d", "Split downloads into time chunks for parallel processing (e.g., 2d, 48h, 30m)")
+	cmd.Flags().Bool("no-chunk", false, "Disable time chunking entirely")
 
 	// Output flags
 	cmd.Flags().StringP("output", "o", "./output", "Output directory for JSONL files")
+	cmd.Flags().BoolP("gzip", "z", false, "Compress final output files with gzip (.jsonl.gz)")
 
 	// Backoff flags
 	cmd.Flags().Duration("backoff-initial", 5*time.Second, "Initial backoff interval")
@@ -118,7 +131,7 @@ func SetupFlags(cmd *cobra.Command) {
 	cmd.Flags().Bool("include-identity-events", true, "Include includeIdentityEvents in API requests")
 	cmd.Flags().Bool("support-mdi-only-events", true, "Include supportMdiOnlyEvents in API requests")
 	cmd.Flags().Bool("include-sentinel-events", true, "Include includeSentinelEvents in API requests")
-	cmd.Flags().Int("page-size", 999, "Number of events per API page (1-999)")
+	cmd.Flags().Int("page-size", 1000, "Number of events per API page (1-1000)")
 
 	// Retry settings
 	cmd.Flags().Int("max-retries", 10, "Maximum retries for API requests")
@@ -154,6 +167,13 @@ func Load() (*Config, error) {
 		cfg.ESTSCookie = os.Getenv("MDE_ESTS_COOKIE")
 	}
 
+	// Parse time chunk duration (unless --no-chunk is set)
+	if !cfg.NoChunk {
+		if err := cfg.parseTimeChunk(); err != nil {
+			return nil, err
+		}
+	}
+
 	// Parse time range
 	if err := cfg.parseDateRange(); err != nil {
 		return nil, err
@@ -164,12 +184,40 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	// Load identities from file if specified
+	if err := cfg.loadIdentities(); err != nil {
+		return nil, err
+	}
+
 	// Validate configuration
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 
 	return cfg, nil
+}
+
+// parseTimeChunk parses the --timechunk flag value using tparse for human-readable durations.
+// Supports formats like "2d", "48h", "30m", etc.
+func (c *Config) parseTimeChunk() error {
+	timeChunkStr := viper.GetString("timechunk")
+	if timeChunkStr == "" || timeChunkStr == "0" {
+		c.TimeChunk = 0
+		return nil
+	}
+
+	// Use tparse to parse human-readable duration (supports days, weeks, etc.)
+	duration, err := tparse.AbsoluteDuration(time.Now(), timeChunkStr)
+	if err != nil {
+		return fmt.Errorf("invalid timechunk value %q: %w", timeChunkStr, err)
+	}
+
+	if duration < 0 {
+		return fmt.Errorf("timechunk must be positive, got: %s", timeChunkStr)
+	}
+
+	c.TimeChunk = duration
+	return nil
 }
 
 func (c *Config) parseDateRange() error {
@@ -195,36 +243,55 @@ func (c *Config) parseDateRange() error {
 	return nil
 }
 
-func (c *Config) loadDevices() error {
+// loadEntities loads and deduplicates entities from flags and an optional file.
+// Returns deduplicated list of entities.
+func loadEntities(flagValues []string, filePath string, entityType string) ([]string, error) {
 	seen := make(map[string]bool)
-	var uniqueDevices []string
+	var unique []string
 
-	// Deduplicate devices from flags
-	for _, d := range c.Devices {
-		d = strings.TrimSpace(d)
-		if d != "" && !seen[d] {
-			seen[d] = true
-			uniqueDevices = append(uniqueDevices, d)
+	// Deduplicate from flags
+	for _, v := range flagValues {
+		v = strings.TrimSpace(v)
+		if v != "" && !seen[v] {
+			seen[v] = true
+			unique = append(unique, v)
 		}
 	}
 
-	// Add devices from file (also deduplicated)
-	if c.DeviceFile != "" {
-		data, err := os.ReadFile(c.DeviceFile)
+	// Add from file (also deduplicated)
+	if filePath != "" {
+		data, err := os.ReadFile(filePath)
 		if err != nil {
-			return fmt.Errorf("failed to read device file: %w", err)
+			return nil, fmt.Errorf("failed to read %s file: %w", entityType, err)
 		}
 
 		for line := range strings.SplitSeq(string(data), "\n") {
 			line = strings.TrimSpace(line)
 			if line != "" && !strings.HasPrefix(line, "#") && !seen[line] {
 				seen[line] = true
-				uniqueDevices = append(uniqueDevices, line)
+				unique = append(unique, line)
 			}
 		}
 	}
 
-	c.Devices = uniqueDevices
+	return unique, nil
+}
+
+func (c *Config) loadDevices() error {
+	devices, err := loadEntities(c.Devices, c.DeviceFile, "device")
+	if err != nil {
+		return err
+	}
+	c.Devices = devices
+	return nil
+}
+
+func (c *Config) loadIdentities() error {
+	identities, err := loadEntities(c.Identities, c.IdentityFile, "identity")
+	if err != nil {
+		return err
+	}
+	c.Identities = identities
 	return nil
 }
 
@@ -252,8 +319,8 @@ func (c *Config) Validate() error {
 		c.ClientID = auth.DefaultClientID
 	}
 
-	if len(c.Devices) == 0 {
-		return fmt.Errorf("at least one device must be specified (via --devices or --file)")
+	if len(c.Devices) == 0 && len(c.Identities) == 0 {
+		return fmt.Errorf("at least one device or identity must be specified (via --devices, --file, --identities, or --identity-file)")
 	}
 	if c.FromDate.After(c.ToDate) || c.FromDate.Equal(c.ToDate) {
 		return fmt.Errorf("from date must be before to date")
@@ -261,8 +328,8 @@ func (c *Config) Validate() error {
 	if c.Workers < 1 {
 		return fmt.Errorf("workers must be at least 1")
 	}
-	if c.TimeChunkDays < 0 {
-		return fmt.Errorf("timechunk must be >= 0 (0 disables chunking)")
+	if c.TimeChunk < 0 {
+		return fmt.Errorf("timechunk must be positive")
 	}
 
 	return nil

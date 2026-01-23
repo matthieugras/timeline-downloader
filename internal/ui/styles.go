@@ -79,6 +79,10 @@ var (
 	WorkerMergingStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("214"))
 
+	// Skipped style (yellow/dimmed)
+	SkippedStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("178"))
+
 	// Progress bar colors
 	ProgressGradientStart = "#5A56E0"
 	ProgressGradientEnd   = "#EE6FF8"

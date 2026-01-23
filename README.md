@@ -1,17 +1,19 @@
 # Timeline Downloader
 
-A CLI tool for downloading device timeline events from Microsoft Defender XDR using the unofficial apiproxy feature. Features parallel processing, automatic token refresh, intelligent rate limiting, and an interactive terminal UI.
+A CLI tool for downloading device and identity timeline events from Microsoft Defender XDR using the unofficial apiproxy feature. Features parallel processing, automatic token refresh, intelligent rate limiting, and an interactive terminal UI.
 
 ## Features
 
-- **Parallel Processing**: Download timelines from multiple devices concurrently with configurable worker pools
+- **Parallel Processing**: Download timelines from multiple devices and identities concurrently with configurable worker pools
 - **Time Chunking**: Split large date ranges into parallel chunks for faster downloads
 - **Dual Authentication**: Supports both OAuth 2.0 refresh tokens and ESTS cookie-based authentication
 - **Automatic Token Refresh**: Handles token expiration and rotation transparently
 - **Intelligent Rate Limiting**: Global exponential backoff with jitter prevents API throttling
 - **Interactive Terminal UI**: Real-time progress display with per-worker status tracking
 - **JSONL Output**: Machine-readable format for downstream SIEM/analysis tools
-- **Flexible Input**: Accept device hostnames, machine IDs, or load from file
+- **Gzip Compression**: Optional output compression with `--gzip` flag
+- **Flexible Input**: Accept device hostnames, machine IDs, identity usernames/UPNs, or load from file
+- **Identity Timeline Support**: Download timeline events for identities (users/accounts) in addition to devices
 
 ## Installation
 
@@ -96,23 +98,28 @@ Uses browser session cookies for authentication. Useful when refresh tokens are 
 | `--client-id` | | OAuth client ID | Teams app ID |
 | `--devices` | `-d` | Comma-separated device list | |
 | `--file` | `-f` | File with device list | |
+| `--identities` | | Comma-separated identity search terms (usernames, UPNs) | |
+| `--identity-file` | | File with identity search terms | |
 | `--from` | | Start date (RFC3339) | 7 days ago |
 | `--to` | | End date (RFC3339) | now |
 | `--days` | | Days to look back | 7 |
 | `--workers` | `-w` | Parallel workers | 5 |
-| `--timechunk` | | Split downloads into N-day chunks | 0 (disabled) |
+| `--timechunk` | | Time chunk size (e.g., 2d, 48h, 30m) | 2d |
+| `--no-chunk` | | Disable time chunking entirely | false |
 | `--output` | `-o` | Output directory | ./output |
+| `--gzip` | `-z` | Compress output with gzip (.jsonl.gz) | false |
 | `--simple` | | Disable fancy UI | false |
 | `--verbose` | `-v` | Verbose output | false |
 | `--log-file` | | Log file path | |
-| `--backoff-initial` | | Initial backoff | 1s |
+| `--max-retries` | | Maximum API request retries | 10 |
+| `--backoff-initial` | | Initial backoff | 5s |
 | `--backoff-max` | | Maximum backoff | 60s |
 | `--timeout` | | HTTP request timeout | 5m |
 | `--generate-identity-events` | | Include identity generation events | true |
 | `--include-identity-events` | | Include identity events | true |
 | `--support-mdi-only-events` | | Include MDI-only events | true |
 | `--include-sentinel-events` | | Include Sentinel events | true |
-| `--page-size` | | Events per API page (1-999) | 999 |
+| `--page-size` | | Events per API page (1-1000) | 1000 |
 
 ### Environment Variables
 
@@ -134,15 +141,44 @@ a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0  # Machine IDs also work
 server.domain.local
 ```
 
+### Identity File Format
+
+```
+# Comments start with #
+john.doe@example.com    # UPN format
+jane.smith              # Username only
+admin@contoso.com
+```
+
 ## Output
 
-Timeline events are written to JSONL files (one JSON object per line):
+Timeline events are written to JSONL files (one JSON object per line). With `--gzip`, files are compressed with `.jsonl.gz` extension.
+
+### Device Timelines
 
 ```
 output/
 ├── workstation01_a1b2c3d4..._timeline.jsonl
 ├── workstation02_e5f6g7h8..._timeline.jsonl
 └── server_i9j0k1l2..._timeline.jsonl
+```
+
+### Identity Timelines
+
+```
+output/
+├── john.doe_abc123def456..._identity_timeline.jsonl
+├── jane.smith_789xyz012..._identity_timeline.jsonl
+└── admin_345uvw678..._identity_timeline.jsonl
+```
+
+### Combined Output (with gzip)
+
+```
+output/
+├── workstation01_a1b2c3d4..._timeline.jsonl.gz
+├── john.doe_abc123def456..._identity_timeline.jsonl.gz
+└── ...
 ```
 
 Each event contains full forensic details:
@@ -165,6 +201,28 @@ timeline-dl \
   --workers 10
 ```
 
+### Download Identity Timelines
+
+```bash
+timeline-dl \
+  --tenant-id $TENANT_ID \
+  --refresh-token "$REFRESH_TOKEN" \
+  --identities "john.doe@example.com,jane.smith" \
+  --days 14
+```
+
+### Download Both Device and Identity Timelines
+
+```bash
+timeline-dl \
+  --tenant-id $TENANT_ID \
+  --refresh-token "$REFRESH_TOKEN" \
+  --devices workstation01,workstation02 \
+  --identities "admin@contoso.com" \
+  --days 7 \
+  --workers 10
+```
+
 ### Download with Time Chunking
 
 Split a 30-day download into 7-day chunks for parallel processing:
@@ -175,11 +233,22 @@ timeline-dl \
   --refresh-token "$REFRESH_TOKEN" \
   --devices workstation01 \
   --days 30 \
-  --timechunk 7 \
+  --timechunk 7d \
   --workers 5
 ```
 
 This creates 5 parallel jobs (7+7+7+7+2 days) that are automatically merged into the final output file.
+
+### Download with Gzip Compression
+
+```bash
+timeline-dl \
+  --tenant-id $TENANT_ID \
+  --refresh-token "$REFRESH_TOKEN" \
+  --devices workstation01 \
+  --days 30 \
+  --gzip
+```
 
 ### Download Specific Date Range
 
@@ -222,10 +291,11 @@ timeline-dl \
 ### Rate Limiting
 
 The tool automatically handles rate limiting with exponential backoff:
-- Initial wait: 1 second
+- Initial wait: 5 seconds
 - Maximum wait: 60 seconds
 - Multiplier: 2x per retry
 - Jitter: 0-50% randomization
+- Max retries: 10
 
 If you see frequent backoff messages, reduce the number of workers.
 

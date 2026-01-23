@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -13,8 +14,8 @@ type Logger struct {
 	file *os.File
 }
 
-// Global logger instance
-var globalLogger *Logger
+// Global logger instance (accessed atomically for thread-safety)
+var globalLogger atomic.Pointer[Logger]
 
 // Init initializes the global logger with the specified file path
 // If path is empty, logging is disabled
@@ -28,7 +29,8 @@ func Init(path string) error {
 		return fmt.Errorf("failed to open log file: %w", err)
 	}
 
-	globalLogger = &Logger{file: file}
+	logger := &Logger{file: file}
+	globalLogger.Store(logger)
 
 	// Write header
 	Info("=== Timeline Downloader Log Started ===")
@@ -36,48 +38,64 @@ func Init(path string) error {
 	return nil
 }
 
-// Close closes the global logger
+// Close closes the global logger, ensuring all pending writes complete first.
+// Sets file to nil under lock to prevent race with concurrent log() calls.
 func Close() {
-	if globalLogger != nil && globalLogger.file != nil {
-		globalLogger.file.Close()
+	logger := globalLogger.Swap(nil)
+	if logger != nil {
+		logger.mu.Lock()
+		if logger.file != nil {
+			logger.file.Close()
+			logger.file = nil // Prevent writes to closed file
+		}
+		logger.mu.Unlock()
 	}
 }
 
 // Info logs an info message
 func Info(format string, args ...any) {
-	if globalLogger == nil {
+	logger := globalLogger.Load()
+	if logger == nil {
 		return
 	}
-	globalLogger.log("INFO", format, args...)
+	logger.log("INFO", format, args...)
 }
 
 // Error logs an error message
 func Error(format string, args ...any) {
-	if globalLogger == nil {
+	logger := globalLogger.Load()
+	if logger == nil {
 		return
 	}
-	globalLogger.log("ERROR", format, args...)
+	logger.log("ERROR", format, args...)
 }
 
 // Warn logs a warning message
 func Warn(format string, args ...any) {
-	if globalLogger == nil {
+	logger := globalLogger.Load()
+	if logger == nil {
 		return
 	}
-	globalLogger.log("WARN", format, args...)
+	logger.log("WARN", format, args...)
 }
 
 // Debug logs a debug message
 func Debug(format string, args ...any) {
-	if globalLogger == nil {
+	logger := globalLogger.Load()
+	if logger == nil {
 		return
 	}
-	globalLogger.log("DEBUG", format, args...)
+	logger.log("DEBUG", format, args...)
 }
 
 func (l *Logger) log(level, format string, args ...any) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
+	// Check if file was closed (race with Close())
+	if l.file == nil {
+		return
+	}
 
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
 	msg := fmt.Sprintf(format, args...)
@@ -86,5 +104,5 @@ func (l *Logger) log(level, format string, args ...any) {
 
 // IsEnabled returns true if logging is enabled
 func IsEnabled() bool {
-	return globalLogger != nil
+	return globalLogger.Load() != nil
 }

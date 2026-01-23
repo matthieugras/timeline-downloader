@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,38 +20,17 @@ const (
 	baseURL = "https://security.microsoft.com"
 )
 
-// TimelineOptions configures the timeline API request parameters
-type TimelineOptions struct {
-	GenerateIdentityEvents bool
-	IncludeIdentityEvents  bool
-	SupportMdiOnlyEvents   bool
-	IncludeSentinelEvents  bool
-	PageSize               int
-}
-
-// DefaultTimelineOptions returns the default timeline options
-func DefaultTimelineOptions() TimelineOptions {
-	return TimelineOptions{
-		GenerateIdentityEvents: true,
-		IncludeIdentityEvents:  true,
-		SupportMdiOnlyEvents:   true,
-		IncludeSentinelEvents:  true,
-		PageSize:               999,
-	}
-}
-
 // Client is the API client for Microsoft Defender
 type Client struct {
-	httpClient      *http.Client
-	auth            auth.Authenticator
-	backoff         *backoff.GlobalBackoff
-	timelineOptions TimelineOptions
-	maxRetries      int
+	httpClient *http.Client
+	auth       auth.Authenticator
+	backoff    *backoff.GlobalBackoff
+	maxRetries int
 }
 
 // NewClient creates a new API client.
 // If httpClient is nil, a default client with 60s timeout is created.
-func NewClient(httpClient *http.Client, authenticator auth.Authenticator, bo *backoff.GlobalBackoff, opts TimelineOptions, maxRetries int) *Client {
+func NewClient(httpClient *http.Client, authenticator auth.Authenticator, bo *backoff.GlobalBackoff, maxRetries int) *Client {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 60 * time.Second}
 	}
@@ -58,16 +38,27 @@ func NewClient(httpClient *http.Client, authenticator auth.Authenticator, bo *ba
 		maxRetries = 6 // Default
 	}
 	return &Client{
-		httpClient:      httpClient,
-		auth:            authenticator,
-		backoff:         bo,
-		timelineOptions: opts,
-		maxRetries:      maxRetries,
+		httpClient: httpClient,
+		auth:       authenticator,
+		backoff:    bo,
+		maxRetries: maxRetries,
 	}
 }
 
-// doRequest performs an authenticated HTTP request with backoff handling
+// doRequest performs an authenticated HTTP GET request with backoff handling
 func (c *Client) doRequest(ctx context.Context, method, path string) (*http.Response, error) {
+	return c.doRequestWithBody(ctx, method, path, nil)
+}
+
+// doRequestWithBody performs an authenticated HTTP request with optional body and backoff handling.
+// This is the common implementation shared by GET and POST requests.
+func (c *Client) doRequestWithBody(ctx context.Context, method, path string, body io.Reader) (*http.Response, error) {
+	return c.doRequestWithBodyAndHeaders(ctx, method, path, body, nil)
+}
+
+// doRequestWithBodyAndHeaders performs an authenticated HTTP request with optional body, headers, and backoff handling.
+// This is the common implementation shared by GET and POST requests.
+func (c *Client) doRequestWithBodyAndHeaders(ctx context.Context, method, path string, body io.Reader, headers map[string]string) (*http.Response, error) {
 	// Wait if global backoff is active
 	if err := c.backoff.WaitIfNeeded(ctx); err != nil {
 		return nil, err
@@ -76,21 +67,44 @@ func (c *Client) doRequest(ctx context.Context, method, path string) (*http.Resp
 	url := baseURL + path
 	logging.Debug("API Request: %s %s", method, url)
 
-	req, err := http.NewRequestWithContext(ctx, method, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+	// Buffer the body so it can be re-read on retry (e.g., after 401 token refresh)
+	var bodyBytes []byte
+	if body != nil {
+		var err error
+		bodyBytes, err = io.ReadAll(body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read request body: %w", err)
+		}
 	}
 
-	req.Header.Set("User-Agent", auth.DefaultUserAgent)
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
+	// Create request factory for initial + potential retry
+	createRequest := func() (*http.Request, error) {
+		var bodyReader io.Reader
+		if bodyBytes != nil {
+			bodyReader = bytes.NewReader(bodyBytes)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+		req.Header.Set("User-Agent", auth.DefaultUserAgent)
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Content-Type", "application/json")
+		// Apply additional headers
+		for key, value := range headers {
+			req.Header.Set(key, value)
+		}
+		if err := c.auth.Authenticate(ctx, req); err != nil {
+			apiErr := NewAPIError(http.StatusUnauthorized, fmt.Sprintf("authentication failed: %v", err))
+			apiErr.Fatal = true
+			return nil, apiErr
+		}
+		return req, nil
+	}
 
-	// Add authentication (Bearer token OR cookies+XSRF depending on auth method)
-	if err := c.auth.Authenticate(ctx, req); err != nil {
-		// Wrap in APIError with Fatal=true so workers know to stop
-		apiErr := NewAPIError(http.StatusUnauthorized, fmt.Sprintf("authentication failed: %v", err))
-		apiErr.Fatal = true
-		return nil, apiErr
+	req, err := createRequest()
+	if err != nil {
+		return nil, err
 	}
 
 	resp, err := c.httpClient.Do(req)
@@ -104,25 +118,15 @@ func (c *Client) doRequest(ctx context.Context, method, path string) (*http.Resp
 	if resp.StatusCode == http.StatusUnauthorized {
 		resp.Body.Close()
 
-		// Force auth refresh
 		if err := c.auth.ForceRefresh(ctx); err != nil {
 			apiErr := NewAPIError(http.StatusUnauthorized, fmt.Sprintf("auth refresh failed: %v", err))
 			apiErr.Fatal = true
 			return nil, apiErr
 		}
 
-		// Retry request
-		req, err = http.NewRequestWithContext(ctx, method, url, nil)
+		req, err = createRequest()
 		if err != nil {
-			return nil, fmt.Errorf("failed to create retry request: %w", err)
-		}
-		req.Header.Set("User-Agent", auth.DefaultUserAgent)
-		req.Header.Set("Accept", "application/json")
-		req.Header.Set("Content-Type", "application/json")
-		if err := c.auth.Authenticate(ctx, req); err != nil {
-			apiErr := NewAPIError(http.StatusUnauthorized, fmt.Sprintf("retry authentication failed: %v", err))
-			apiErr.Fatal = true
-			return nil, apiErr
+			return nil, err
 		}
 
 		resp, err = c.httpClient.Do(req)
@@ -130,7 +134,6 @@ func (c *Client) doRequest(ctx context.Context, method, path string) (*http.Resp
 			return nil, fmt.Errorf("retry request failed: %w", err)
 		}
 
-		// If still 401 after refresh, return fatal error to abort collection
 		if resp.StatusCode == http.StatusUnauthorized {
 			resp.Body.Close()
 			apiErr := NewAPIError(resp.StatusCode, "authentication failed after refresh - aborting collection")
@@ -140,9 +143,15 @@ func (c *Client) doRequest(ctx context.Context, method, path string) (*http.Resp
 		}
 	}
 
+	// Handle response status codes
+	return c.handleResponseStatus(resp)
+}
+
+// handleResponseStatus checks response status and handles errors, rate limiting, etc.
+func (c *Client) handleResponseStatus(resp *http.Response) (*http.Response, error) {
 	// Check for rate limiting / server errors (429, 5xx)
 	if resp.StatusCode == 429 || resp.StatusCode >= 500 {
-		c.backoff.ReportError() // Trigger global backoff
+		c.backoff.ReportError()
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		err := NewAPIError(resp.StatusCode, fmt.Sprintf("API error (status %d): %s", resp.StatusCode, string(body)))
@@ -156,15 +165,13 @@ func (c *Client) doRequest(ctx context.Context, method, path string) (*http.Resp
 		resp.Body.Close()
 		bodyStr := string(body)
 
-		// Microsoft sometimes returns 403 with this message for rate limiting
 		if strings.Contains(bodyStr, "User is not exposed to machine") {
-			c.backoff.ReportError() // Trigger global backoff
+			c.backoff.ReportError()
 			err := NewAPIError(resp.StatusCode, fmt.Sprintf("API error (status %d): %s", resp.StatusCode, bodyStr))
 			err.Retryable = true
 			return nil, err
 		}
 
-		// Real 403 - do NOT trigger backoff, let it fail fast
 		return nil, NewAPIError(resp.StatusCode, fmt.Sprintf("API error (status %d): %s", resp.StatusCode, bodyStr))
 	}
 
@@ -179,18 +186,31 @@ func (c *Client) doRequest(ctx context.Context, method, path string) (*http.Resp
 	return resp, nil
 }
 
-// doRequestWithRetry performs a request with retries for transient errors
-func (c *Client) doRequestWithRetry(ctx context.Context, method, path string, maxRetries int) (*http.Response, error) {
+// requestFunc is a function that performs a single request attempt.
+// Used by doWithRetry to abstract over GET vs POST requests.
+type requestFunc func() (*http.Response, error)
+
+// doWithRetry performs a request with retries for transient errors.
+// This is the unified retry logic used by both GET and POST requests.
+//
+// Backoff strategy:
+// - Global backoff (rate limiting): Handled by WaitIfNeeded at the start of each attempt
+// - Local backoff (transient errors): Exponential backoff for non-rate-limited errors
+func (c *Client) doWithRetry(ctx context.Context, maxRetries int, reqFunc requestFunc) (*http.Response, error) {
 	var lastErr error
 
 	for attempt := range maxRetries {
 		if attempt > 0 {
-			// Check if last error was a rate-limit (Retryable = true means global backoff was triggered)
+			// Always wait for global backoff first (returns immediately if not active)
+			if err := c.backoff.WaitIfNeeded(ctx); err != nil {
+				return nil, err
+			}
+
+			// For non-rate-limited errors, add local exponential backoff
+			// Rate-limited errors already triggered global backoff above
 			var apiErr *APIError
 			wasRateLimited := errors.As(lastErr, &apiErr) && apiErr.Retryable
-
 			if !wasRateLimited {
-				// Not rate-limited: use local exponential backoff (2s, 4s, 8s, 16s, 32s...)
 				waitTime := time.Duration(1<<attempt) * time.Second
 				logging.Debug("Retry attempt %d/%d, waiting %v", attempt+1, maxRetries, waitTime)
 				select {
@@ -199,12 +219,11 @@ func (c *Client) doRequestWithRetry(ctx context.Context, method, path string, ma
 				case <-time.After(waitTime):
 				}
 			} else {
-				// Rate-limited: global backoff handles the wait via WaitIfNeeded in doRequest
-				logging.Debug("Retry attempt %d/%d (rate-limited, using global backoff)", attempt+1, maxRetries)
+				logging.Debug("Retry attempt %d/%d (after global backoff)", attempt+1, maxRetries)
 			}
 		}
 
-		resp, err := c.doRequest(ctx, method, path)
+		resp, err := reqFunc()
 		if err == nil {
 			return resp, nil
 		}
@@ -223,29 +242,46 @@ func (c *Client) doRequestWithRetry(ctx context.Context, method, path string, ma
 	return nil, fmt.Errorf("request failed after %d attempts: %w", maxRetries, lastErr)
 }
 
-// parseJSONResponse reads and parses a JSON response
+// doRequestWithRetry performs a GET/DELETE/etc request with retries for transient errors
+func (c *Client) doRequestWithRetry(ctx context.Context, method, path string, maxRetries int) (*http.Response, error) {
+	return c.doWithRetry(ctx, maxRetries, func() (*http.Response, error) {
+		return c.doRequest(ctx, method, path)
+	})
+}
+
+// doPostRequestWithHeaders performs an authenticated HTTP POST request with JSON body and additional headers
+func (c *Client) doPostRequestWithHeaders(ctx context.Context, path string, body any, headers map[string]string) (*http.Response, error) {
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request body: %w", err)
+	}
+	return c.doRequestWithBodyAndHeaders(ctx, "POST", path, bytes.NewReader(bodyBytes), headers)
+}
+
+// doPostRequestWithRetry performs a POST request with retries for transient errors
+func (c *Client) doPostRequestWithRetry(ctx context.Context, path string, body any, maxRetries int) (*http.Response, error) {
+	return c.doPostRequestWithRetryAndHeaders(ctx, path, body, maxRetries, nil)
+}
+
+// doPostRequestWithRetryAndHeaders performs a POST request with retries and additional headers
+func (c *Client) doPostRequestWithRetryAndHeaders(ctx context.Context, path string, body any, maxRetries int, headers map[string]string) (*http.Response, error) {
+	return c.doWithRetry(ctx, maxRetries, func() (*http.Response, error) {
+		return c.doPostRequestWithHeaders(ctx, path, body, headers)
+	})
+}
+
+// parseJSONResponse reads and parses a JSON response using streaming decoder.
+// This avoids loading the entire response body into memory twice (once as []byte,
+// once as the decoded struct), reducing memory usage for large responses.
 func parseJSONResponse(resp *http.Response, v any) error {
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	if err := json.Unmarshal(body, v); err != nil {
-		// Log the full response body for debugging
-		logging.Error("Failed to parse JSON response from %s (status %d)", resp.Request.URL.String(), resp.StatusCode)
-		logging.Error("Response body (first 2000 chars): %s", truncateString(string(body), 2000))
+	decoder := json.NewDecoder(resp.Body)
+	if err := decoder.Decode(v); err != nil {
+		logging.Error("Failed to parse JSON response from %s (status %d): %v",
+			resp.Request.URL.String(), resp.StatusCode, err)
 		return fmt.Errorf("failed to parse response: %w", err)
 	}
 
 	return nil
-}
-
-// truncateString truncates a string to maxLen characters
-func truncateString(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "...[truncated]"
 }
