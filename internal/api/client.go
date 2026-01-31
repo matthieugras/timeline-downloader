@@ -65,7 +65,9 @@ func (c *Client) doRequestWithBodyAndHeaders(ctx context.Context, method, path s
 	}
 
 	url := baseURL + path
-	logging.Debug("API Request: %s %s", method, url)
+	logging.Debug("API request",
+		"method", method,
+		"url", url)
 
 	// Buffer the body so it can be re-read on retry (e.g., after 401 token refresh)
 	var bodyBytes []byte
@@ -109,10 +111,16 @@ func (c *Client) doRequestWithBodyAndHeaders(ctx context.Context, method, path s
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		logging.Error("Request failed: %s %s - %v", method, url, err)
+		logging.Error("request failed",
+			"method", method,
+			"url", url,
+			"error", err)
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
-	logging.Debug("API Response: %s %s -> %d", method, url, resp.StatusCode)
+	logging.Debug("API response",
+		"method", method,
+		"url", url,
+		"status", resp.StatusCode)
 
 	// Handle 401 - try refreshing auth once
 	if resp.StatusCode == http.StatusUnauthorized {
@@ -212,14 +220,19 @@ func (c *Client) doWithRetry(ctx context.Context, maxRetries int, reqFunc reques
 			wasRateLimited := errors.As(lastErr, &apiErr) && apiErr.Retryable
 			if !wasRateLimited {
 				waitTime := time.Duration(1<<attempt) * time.Second
-				logging.Debug("Retry attempt %d/%d, waiting %v", attempt+1, maxRetries, waitTime)
+				logging.Debug("retry attempt",
+					"attempt", attempt+1,
+					"max_retries", maxRetries,
+					"wait_time", waitTime)
 				select {
 				case <-ctx.Done():
 					return nil, ctx.Err()
 				case <-time.After(waitTime):
 				}
 			} else {
-				logging.Debug("Retry attempt %d/%d (after global backoff)", attempt+1, maxRetries)
+				logging.Debug("retry attempt after global backoff",
+					"attempt", attempt+1,
+					"max_retries", maxRetries)
 			}
 		}
 
@@ -278,8 +291,10 @@ func parseJSONResponse(resp *http.Response, v any) error {
 
 	decoder := json.NewDecoder(resp.Body)
 	if err := decoder.Decode(v); err != nil {
-		logging.Error("Failed to parse JSON response from %s (status %d): %v",
-			resp.Request.URL.String(), resp.StatusCode, err)
+		logging.Error("failed to parse JSON response",
+			"url", resp.Request.URL.String(),
+			"status", resp.StatusCode,
+			"error", err)
 		return fmt.Errorf("failed to parse response: %w", err)
 	}
 

@@ -199,6 +199,7 @@ func DownloadDeviceTimeline(
 	opts DeviceTimelineOptions,
 	writer output.EventWriter,
 	progressCallback func(eventCount int, currentDate time.Time),
+	jobID int,
 ) (int, error) {
 	eventCount := 0
 
@@ -212,7 +213,8 @@ func DownloadDeviceTimeline(
 		default:
 		}
 
-		logging.Debug("Timeline request path: %s", currentURL)
+		logging.DebugWithJob(jobID, "timeline request",
+			"path", currentURL)
 		resp, err := client.doRequestWithRetry(ctx, "GET", currentURL, client.maxRetries)
 		if err != nil {
 			return eventCount, fmt.Errorf("timeline request failed: %w", err)
@@ -222,6 +224,10 @@ func DownloadDeviceTimeline(
 		if err := parseJSONResponse(resp, &timeline); err != nil {
 			return eventCount, fmt.Errorf("failed to parse timeline response: %w", err)
 		}
+
+		logging.DebugWithJob(jobID, "timeline response",
+			"events_returned", len(timeline.Items),
+			"has_next", timeline.Next != "")
 
 		// Write events to JSONL
 		for _, item := range timeline.Items {
@@ -241,24 +247,27 @@ func DownloadDeviceTimeline(
 		}
 
 		currentURL = timelineAPIPrefix + timeline.Next
-		logging.Debug("Next pagination path: %s", timeline.Next)
+		logging.DebugWithJob(jobID, "next pagination path",
+			"path", timeline.Next)
 
 		// Parse fromDate from Next link - this is our current progress through the date range
-		nextFromDate := parseFromDateFromURL(currentURL)
+		nextFromDate, err := parseFromDateFromURL(currentURL)
+		if err != nil {
+			logging.WarnWithJob(jobID, "could not parse fromDate from pagination URL",
+				"error", err,
+				"fallback", "using original fromDate for progress")
+			nextFromDate = fromDate
+		}
 
 		// Report progress using the parsed date from pagination
 		if progressCallback != nil {
-			if !nextFromDate.IsZero() {
-				progressCallback(eventCount, nextFromDate)
-			} else {
-				// Warn if we couldn't parse the date - API format may have changed
-				logging.Warn("Could not parse fromDate from pagination URL, using original fromDate for progress")
-				progressCallback(eventCount, fromDate)
-			}
+			progressCallback(eventCount, nextFromDate)
 		}
 
-		if !nextFromDate.IsZero() && nextFromDate.After(toDate) {
-			logging.Debug("Stopping pagination: nextFromDate %v is after toDate %v", nextFromDate, toDate)
+		if nextFromDate.After(toDate) {
+			logging.DebugWithJob(jobID, "stopping pagination",
+				"next_from_date", nextFromDate,
+				"to_date", toDate)
 			break
 		}
 	}
@@ -295,21 +304,19 @@ func buildDeviceTimelineURL(device *Device, fromDate, toDate time.Time, opts Dev
 }
 
 // parseFromDateFromURL extracts the fromDate query parameter from a pagination URL
-func parseFromDateFromURL(link string) time.Time {
+func parseFromDateFromURL(link string) (time.Time, error) {
 	parsed, err := url.Parse(link)
 	if err != nil {
-		return time.Time{}
+		return time.Time{}, fmt.Errorf("failed to parse URL: %w", err)
 	}
 
 	fromDateStr := parsed.Query().Get("fromDate")
 	if fromDateStr == "" {
-		return time.Time{}
+		return time.Time{}, fmt.Errorf("fromDate parameter missing from URL")
 	}
 
 	// Try multiple date formats
 	formats := []string{
-		time.RFC3339Nano,
-		time.RFC3339,
 		"2006-01-02T15:04:05.0000000Z",
 		"2006-01-02T15:04:05.000Z",
 		"2006-01-02T15:04:05Z",
@@ -317,9 +324,9 @@ func parseFromDateFromURL(link string) time.Time {
 
 	for _, format := range formats {
 		if t, err := time.Parse(format, fromDateStr); err == nil {
-			return t
+			return t, nil
 		}
 	}
 
-	return time.Time{}
+	return time.Time{}, fmt.Errorf("failed to parse fromDate: %s", fromDateStr)
 }

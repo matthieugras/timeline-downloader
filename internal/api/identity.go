@@ -263,6 +263,7 @@ func DownloadIdentityTimeline(
 	pageSize int,
 	writer output.TruncatableWriter,
 	progressCallback func(eventCount int, currentDate time.Time),
+	jobID int,
 ) (int, error) {
 	eventCount := 0
 	pageSize = min(pageSize, IdentityMaxPageSize)
@@ -314,7 +315,7 @@ func DownloadIdentityTimeline(
 
 			// Skip events with missing timestamp (writer would filter anyway)
 			if eventTime.IsZero() {
-				logging.Warn("Skipping identity event with missing timestamp")
+				logging.WarnWithJob(jobID, "skipping identity event with missing timestamp")
 				continue
 			}
 
@@ -351,7 +352,7 @@ func DownloadIdentityTimeline(
 		nextSkip := skip + len(timeline.Data)
 		if nextSkip > IdentityMaxSkip {
 			if batchMinTime.IsZero() {
-				logging.Warn("Skip limit reached but no events found")
+				logging.WarnWithJob(jobID, "skip limit reached but no events found")
 				break
 			}
 
@@ -360,8 +361,10 @@ func DownloadIdentityTimeline(
 				// PATHOLOGICAL CASE: >10000 events at same second (pageSize + maxSkip)
 				// We cannot fetch all events at this timestamp due to API limits.
 				// Skip the problematic second entirely and continue with older events.
-				logging.Warn("DATA LOSS: >%d events at %s cannot be fully retrieved (API limit). Skipping to older events.",
-					IdentityMaxSkip+pageSize, batchMinTime.Format(time.RFC3339))
+				logging.WarnWithJob(jobID, "data loss due to API limit",
+					"max_events", IdentityMaxSkip+pageSize,
+					"timestamp", batchMinTime.Format(time.RFC3339),
+					"action", "skipping to older events")
 
 				// Use exclusive bound to skip batchMinTime entirely
 				currentTo = batchMinTime
@@ -378,8 +381,10 @@ func DownloadIdentityTimeline(
 			}
 			eventCount -= boundaryCount
 
-			logging.Info("Skip limit reached (%d), restarting at %s (truncated %d boundary events)",
-				nextSkip, batchMinTime.Format(time.RFC3339), boundaryCount)
+			logging.InfoWithJob(jobID, "skip limit reached, restarting sub-chunk",
+				"next_skip", nextSkip,
+				"restart_time_nano", batchMinTime.UnixNano(),
+				"truncated_boundary_events", boundaryCount)
 
 			// INCLUSIVE: add 1 second so batchMinTime events are included
 			currentTo = batchMinTime.Add(time.Second)

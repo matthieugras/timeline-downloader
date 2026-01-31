@@ -196,8 +196,10 @@ func (p *Pool) trackChunkAndMaybeMerge(workerID int, job Job, result *JobResult)
 		// Bounds check to prevent panic if ChunkIndex is invalid
 		if chunkIdx < 0 || chunkIdx >= len(tracker.chunkFiles) {
 			p.chunkTrackersMu.Unlock()
-			logging.Error("Invalid chunk index %d for entity %s (expected 0-%d)",
-				chunkIdx, key, len(tracker.chunkFiles)-1)
+			logging.Error("invalid chunk index",
+				"chunk_index", chunkIdx,
+				"entity", key,
+				"expected_max", len(tracker.chunkFiles)-1)
 			return nil
 		}
 		tracker.displayName = result.Entity.EntityDisplayName()
@@ -266,8 +268,10 @@ func (p *Pool) trackChunkAndMaybeMerge(workerID int, job Job, result *JobResult)
 	// Check for partial completion - abort if some chunks failed
 	if len(validFiles) != len(chunkFiles) {
 		failedCount := len(chunkFiles) - len(validFiles)
-		logging.Error("Partial merge aborted for %s: %d/%d chunks failed",
-			displayName, failedCount, len(chunkFiles))
+		logging.Error("partial merge aborted",
+			"entity", displayName,
+			"failed_chunks", failedCount,
+			"total_chunks", len(chunkFiles))
 		return &JobResult{
 			MergeJob: &MergeJob{
 				ID:     -1,
@@ -304,7 +308,10 @@ func (p *Pool) performMerge(workerID int, entityType EntityType, displayName, pr
 	outputPath := p.fileManager.GetFinalPath(displayName, primaryKey, isIdentity)
 	totalBytes, _ := output.CalculateTotalBytes(filesToMerge)
 
-	logging.Info("Starting merge for %s: %d chunk files -> %s", displayName, len(filesToMerge), outputPath)
+	logging.Info("starting merge",
+		"entity", displayName,
+		"chunk_files", len(filesToMerge),
+		"output_path", outputPath)
 
 	// Update status to merging
 	p.updateMergeStatus(workerID, displayName, 0, totalBytes)
@@ -343,9 +350,14 @@ func (p *Pool) performMerge(workerID int, entityType EntityType, displayName, pr
 
 	if err != nil {
 		result.Error = fmt.Errorf("merge failed: %w", err)
-		logging.Error("Merge failed for %s: %v", displayName, err)
+		logging.Error("merge failed",
+			"entity", displayName,
+			"error", err)
 	} else {
-		logging.Info("Merged %s: %d bytes written to %s", displayName, bytesWritten, outputPath)
+		logging.Info("merge completed",
+			"entity", displayName,
+			"bytes_written", bytesWritten,
+			"output_path", outputPath)
 	}
 
 	return &result
@@ -439,7 +451,9 @@ func (p *Pool) markEntityFailed(entityKey string, reason string) bool {
 	group.failReason = reason
 	group.cancel() // Cancel the context to abort in-flight requests
 
-	logging.Error("Entity %s: all processing cancelled due to error: %s", entityKey, reason)
+	logging.Error("entity processing cancelled",
+		"entity", entityKey,
+		"reason", reason)
 	return true
 }
 
@@ -542,7 +556,7 @@ func (p *Pool) handleJobError(result *JobResult, err error, entityKey string, sk
 	var apiErr *api.APIError
 	if errors.As(err, &apiErr) && apiErr.Fatal {
 		result.Fatal = true
-		logging.Error("Fatal error encountered, stopping all jobs")
+		logging.Error("fatal error encountered, stopping all jobs")
 		p.cancel() // Stop the pool
 		return true
 	}
@@ -582,7 +596,9 @@ func (p *Pool) getOrResolveEntity(ctx context.Context, job Job) (api.ResolvedEnt
 		p.entityCacheMu.RUnlock()
 
 		// Resolve entity
-		logging.Info("Resolving %s: %s", job.TypeName(), job.InputValue())
+		logging.Info("resolving entity",
+			"type", job.TypeName(),
+			"input", job.InputValue())
 		entity, err := job.ResolveEntity(ctx, p.client, p.tenantID)
 		if err != nil {
 			return nil, err
@@ -641,7 +657,10 @@ func (p *Pool) processDownloadJob(workerID int, job Job) JobResult {
 	entity, err := p.getOrResolveEntity(ctx, job)
 	if err != nil {
 		result.Error = fmt.Errorf("%s resolution failed: %w", job.TypeName(), err)
-		logging.Error("%s resolution failed for %s: %v", job.TypeNameTitle(), job.InputValue(), err)
+		logging.ErrorWithJob(job.JobID(), "entity resolution failed",
+			"type", job.TypeName(),
+			"input", job.InputValue(),
+			"error", err)
 		result.Duration = time.Since(start)
 		p.handleJobError(&result, err, entityKey, false)
 		return result
@@ -653,7 +672,10 @@ func (p *Pool) processDownloadJob(workerID int, job Job) JobResult {
 	// Check for duplicate primary key
 	if originalKey, isNew := p.checkAndRegisterPrimaryKey(entity.PrimaryKey(), entityKey); !isNew {
 		reason := fmt.Sprintf("duplicate: %s %s already processed via %s", job.PrimaryKeyLabel(), entity.PrimaryKey(), originalKey)
-		logging.Info("Skipping %s %s: %s", job.TypeName(), job.InputValue(), reason)
+		logging.Info("skipping duplicate entity",
+			"type", job.TypeName(),
+			"input", job.InputValue(),
+			"reason", reason)
 		result.Skipped = true
 		result.SkippedReason = reason
 		result.Duration = time.Since(start)
@@ -675,40 +697,56 @@ func (p *Pool) processDownloadJob(workerID int, job Job) JobResult {
 		)
 		if err != nil {
 			result.Error = fmt.Errorf("failed to create chunk file: %w", err)
-			logging.Error("Failed to create chunk file for %s: %v", displayName, err)
+			logging.ErrorWithJob(job.JobID(), "failed to create chunk file",
+				"entity", displayName,
+				"error", err)
 			result.Duration = time.Since(start)
 			p.markEntityFailed(entityKey, err.Error())
 			return result
 		}
-		logging.Info("Chunk file: %s (chunk %d/%d)", outputPath, chunkInfo.ChunkIndex+1, chunkInfo.TotalChunks)
+		logging.LogChunkBoundary(job.JobID(), chunkInfo.ChunkIndex, chunkInfo.TotalChunks,
+			job.FromDate().UnixNano(), job.ToDate().UnixNano())
+		logging.InfoWithJob(job.JobID(), "chunk file created",
+			"path", outputPath,
+			"from_nano", job.FromDate().UnixNano(),
+			"to_nano", job.ToDate().UnixNano())
 	} else {
 		writer, outputPath, err = p.fileManager.GetWriter(displayName, entity.PrimaryKey(), fromDate, toDate, job.IsIdentity())
 		if err != nil {
 			result.Error = fmt.Errorf("failed to create output file: %w", err)
-			logging.Error("Failed to create output file for %s: %v", displayName, err)
+			logging.ErrorWithJob(job.JobID(), "failed to create output file",
+				"entity", displayName,
+				"error", err)
 			result.Duration = time.Since(start)
 			p.markEntityFailed(entityKey, err.Error())
 			return result
 		}
-		logging.Info("Output file: %s", outputPath)
+		logging.InfoWithJob(job.JobID(), "output file created",
+			"path", outputPath)
 	}
 	result.OutputFile = outputPath
 
 	var ctxCancelledBeforeCleanup bool
 	defer func() {
 		if err := writer.Close(); err != nil {
-			logging.Error("Failed to close writer for %s: %v", displayName, err)
+			logging.ErrorWithJob(job.JobID(), "failed to close writer",
+				"entity", displayName,
+				"error", err)
 		}
 		if ctxCancelledBeforeCleanup {
 			if err := os.Remove(outputPath); err == nil {
-				logging.Debug("Cleaned up partial file on cancellation: %s", outputPath)
+				logging.DebugWithJob(job.JobID(), "cleaned up partial file on cancellation",
+					"path", outputPath)
 			}
 		}
 	}()
 
 	// Download timeline
-	logging.Info("Downloading %s timeline for %s from %s to %s",
-		job.TypeName(), displayName, job.FromDate().Format("2006-01-02"), job.ToDate().Format("2006-01-02"))
+	logging.InfoWithJob(job.JobID(), "downloading timeline",
+		"type", job.TypeName(),
+		"entity", displayName,
+		"from", job.FromDate().Format("2006-01-02"),
+		"to", job.ToDate().Format("2006-01-02"))
 	progressCallback := func(eventCount int, currentDate time.Time) {
 		p.checkAndUpdateBackoffState(workerID, displayName, job, eventCount, currentDate)
 	}
@@ -716,13 +754,18 @@ func (p *Pool) processDownloadJob(workerID int, job Job) JobResult {
 	eventCount, err := job.DownloadTimeline(ctx, p.client, entity, writer, progressCallback)
 	if err != nil {
 		result.Error = fmt.Errorf("%s timeline download failed: %w", job.TypeName(), err)
-		logging.Error("%s timeline download failed for %s: %v", job.TypeNameTitle(), displayName, err)
+		logging.ErrorWithJob(job.JobID(), "timeline download failed",
+			"type", job.TypeName(),
+			"entity", displayName,
+			"error", err)
 		result.Duration = time.Since(start)
 		ctxCancelledBeforeCleanup = ctx.Err() != nil
 		p.handleJobError(&result, err, entityKey, true)
 		return result
 	}
-	logging.Info("Downloaded %d events for %s", eventCount, displayName)
+	logging.InfoWithJob(job.JobID(), "download completed",
+		"entity", displayName,
+		"event_count", eventCount)
 
 	result.EventCount = eventCount
 	result.Duration = time.Since(start)

@@ -65,8 +65,12 @@ func run(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to initialize logging: %w", err)
 		}
 		defer logging.Close()
-		logging.Info("Configuration loaded: %d devices, %d identities, %d workers, from=%s to=%s",
-			len(cfg.Devices), len(cfg.Identities), cfg.Workers, cfg.FromDate.Format("2006-01-02"), cfg.ToDate.Format("2006-01-02"))
+		logging.Info("configuration loaded",
+			"devices", len(cfg.Devices),
+			"identities", len(cfg.Identities),
+			"workers", cfg.Workers,
+			"from", cfg.FromDate.Format("2006-01-02"),
+			"to", cfg.ToDate.Format("2006-01-02"))
 	}
 
 	// Setup context with signal handling using NotifyContext.

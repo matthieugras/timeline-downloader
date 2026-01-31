@@ -41,11 +41,11 @@ func (m *mockAuthenticator) Close() error {
 
 // mockTruncatableWriter implements output.TruncatableWriter for testing
 type mockTruncatableWriter struct {
-	mu             sync.Mutex
-	events         []json.RawMessage
-	truncateCalls  []int // records n values passed to TruncateLastLines
-	writeErr       error
-	truncateErr    error
+	mu            sync.Mutex
+	events        []json.RawMessage
+	truncateCalls []int // records n values passed to TruncateLastLines
+	writeErr      error
+	truncateErr   error
 }
 
 func (w *mockTruncatableWriter) Write(data json.RawMessage) error {
@@ -188,6 +188,7 @@ func TestDownloadIdentityTimeline_SimplePagination(t *testing.T) {
 		100, // page size larger than events returned
 		writer,
 		nil,
+		0, // jobID for test
 	)
 
 	if err != nil {
@@ -220,14 +221,15 @@ func TestDownloadIdentityTimeline_MultiplePages(t *testing.T) {
 		body, _ := io.ReadAll(req.Body)
 		json.Unmarshal(body, &reqBody)
 
-		if reqBody.Skip == 0 {
+		switch reqBody.Skip {
+		case 0:
 			// First page: 5 events
 			events := make([]map[string]any, 5)
 			for i := 0; i < 5; i++ {
 				events[i] = makeEvent(baseTime.Add(-time.Duration(i)*time.Hour), fmt.Sprintf("page1-event%d", i))
 			}
 			return makeTimelineResponse(events), nil
-		} else if reqBody.Skip == 5 {
+		case 5:
 			// Second page: 3 events (end)
 			events := make([]map[string]any, 3)
 			for i := 0; i < 3; i++ {
@@ -247,6 +249,7 @@ func TestDownloadIdentityTimeline_MultiplePages(t *testing.T) {
 		5, // page size
 		writer,
 		nil,
+		0, // jobID for test
 	)
 
 	if err != nil {
@@ -281,8 +284,8 @@ func TestDownloadIdentityTimeline_SkipLimitTruncation(t *testing.T) {
 			restarted = true
 			// After restart: return final events (less than pageSize to end)
 			events := []map[string]any{
-				makeEvent(boundaryTime, "restart-event1"),                  // boundary event (refetched)
-				makeEvent(boundaryTime, "restart-event2"),                  // boundary event (refetched)
+				makeEvent(boundaryTime, "restart-event1"), // boundary event (refetched)
+				makeEvent(boundaryTime, "restart-event2"), // boundary event (refetched)
 				makeEvent(boundaryTime.Add(-time.Hour), "final-event"),
 			}
 			return makeTimelineResponse(events), nil
@@ -291,7 +294,7 @@ func TestDownloadIdentityTimeline_SkipLimitTruncation(t *testing.T) {
 		// Before restart: simulate pagination until skip limit
 		// Return 1000 events each time, with last 2 at boundary time
 		events := make([]map[string]any, 1000)
-		for i := 0; i < 998; i++ {
+		for i := range 998 {
 			// Use different timestamps, all newer than boundaryTime
 			eventTime := boundaryTime.Add(time.Duration(1000-i) * time.Minute)
 			events[i] = makeEvent(eventTime, fmt.Sprintf("event-%d-%d", requestNum, i))
@@ -314,6 +317,7 @@ func TestDownloadIdentityTimeline_SkipLimitTruncation(t *testing.T) {
 		func(eventCount int, currentDate time.Time) {
 			progressCalls++
 		},
+		0, // jobID for test
 	)
 
 	if err != nil {
@@ -381,6 +385,7 @@ func TestDownloadIdentityTimeline_BoundaryTracking(t *testing.T) {
 		10, // pageSize > returned events, so it ends after first page
 		writer,
 		nil,
+		0, // jobID for test
 	)
 
 	if err != nil {
@@ -416,6 +421,7 @@ func TestDownloadIdentityTimeline_EmptyResponse(t *testing.T) {
 		100,
 		writer,
 		nil,
+		0, // jobID for test
 	)
 
 	if err != nil {
@@ -448,6 +454,7 @@ func TestDownloadIdentityTimeline_ContextCancellation(t *testing.T) {
 		100,
 		writer,
 		nil,
+		0, // jobID for test
 	)
 
 	if err != context.Canceled {
@@ -479,6 +486,7 @@ func TestDownloadIdentityTimeline_MissingTimestamp(t *testing.T) {
 		100,
 		writer,
 		nil,
+		0, // jobID for test
 	)
 
 	if err != nil {
@@ -514,6 +522,7 @@ func TestDownloadIdentityTimeline_WriteError(t *testing.T) {
 		100,
 		writer,
 		nil,
+		0, // jobID for test
 	)
 
 	if err == nil {
@@ -554,6 +563,7 @@ func TestDownloadIdentityTimeline_TruncateError(t *testing.T) {
 		1000,
 		writer,
 		nil,
+		0, // jobID for test
 	)
 
 	// Should eventually hit skip limit and try to truncate, which will fail
@@ -591,7 +601,7 @@ func TestDownloadIdentityTimeline_PathologicalCase(t *testing.T) {
 
 		// Always return events at stuckTime to simulate pathological case
 		events := make([]map[string]any, 1000)
-		for i := 0; i < 1000; i++ {
+		for i := range 1000 {
 			events[i] = makeEvent(stuckTime, fmt.Sprintf("stuck-event-%d", i))
 		}
 		return makeTimelineResponse(events), nil
@@ -606,6 +616,7 @@ func TestDownloadIdentityTimeline_PathologicalCase(t *testing.T) {
 		1000,
 		writer,
 		nil,
+		0, // jobID for test
 	)
 
 	if err != nil {
@@ -652,6 +663,7 @@ func TestDownloadIdentityTimeline_ProgressCallback(t *testing.T) {
 			progressEvents = append(progressEvents, eventCount)
 			progressDates = append(progressDates, currentDate)
 		},
+		0, // jobID for test
 	)
 
 	if err != nil {
@@ -695,6 +707,7 @@ func TestDownloadIdentityTimeline_PageSizeCap(t *testing.T) {
 		5000, // Request larger than max
 		writer,
 		nil,
+		0, // jobID for test
 	)
 
 	if capturedCount != IdentityMaxPageSize {
@@ -713,8 +726,8 @@ func TestDownloadIdentityTimeline_UnstableFieldsStripped(t *testing.T) {
 			{
 				"Timestamp": baseTime.Format(time.RFC3339),
 				"EventId":   "event1",
-				"Id":        "unstable-id",       // Should be stripped
-				"RowNumber": 12345,               // Should be stripped
+				"Id":        "unstable-id", // Should be stripped
+				"RowNumber": 12345,         // Should be stripped
 				"Data":      "should-remain",
 			},
 		}
@@ -730,6 +743,7 @@ func TestDownloadIdentityTimeline_UnstableFieldsStripped(t *testing.T) {
 		100,
 		writer,
 		nil,
+		0, // jobID for test
 	)
 
 	if err != nil {

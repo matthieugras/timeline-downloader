@@ -29,7 +29,7 @@ type TruncatableWriter interface {
 }
 
 // TimestampExtractor extracts a timestamp from an event for filtering.
-// Return zero time to skip the event (missing timestamp).
+// Return an error if the timestamp is missing or unparseable.
 type TimestampExtractor func(data json.RawMessage) (time.Time, error)
 
 // actionTimeEvent is used to extract ActionTime from raw event JSON
@@ -45,10 +45,10 @@ func getEventActionTime(data json.RawMessage) (time.Time, error) {
 	}
 
 	if event.ActionTimeIsoString == "" {
-		return time.Time{}, nil
+		return time.Time{}, fmt.Errorf("missing ActionTimeIsoString field")
 	}
 
-	return time.Parse(time.RFC3339, event.ActionTimeIsoString)
+	return time.Parse(time.RFC3339Nano, event.ActionTimeIsoString)
 }
 
 // JSONLWriter writes JSON objects as newline-delimited JSON (JSONL).
@@ -111,7 +111,7 @@ func NewJSONLWriter(path string, from, to time.Time, filterByActionTime bool, us
 
 // Write writes a JSON event.
 // If a timestamp extractor is configured, events are filtered by [from, to).
-// Events with unparseable or missing timestamps are skipped when filtering is enabled.
+// Events with unparseable timestamps are skipped with a warning when filtering is enabled.
 func (w *JSONLWriter) Write(data json.RawMessage) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -124,12 +124,8 @@ func (w *JSONLWriter) Write(data json.RawMessage) error {
 	if w.timestampExtract != nil {
 		ts, err := w.timestampExtract(data)
 		if err != nil {
-			logging.Warn("Event skipped: unparseable timestamp: %v", err)
-			w.filteredCount++
-			return nil
-		}
-		if ts.IsZero() {
-			logging.Debug("Event skipped: missing timestamp")
+			logging.Warn("event skipped",
+				"error", err)
 			w.filteredCount++
 			return nil
 		}

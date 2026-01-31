@@ -122,17 +122,21 @@ func (d *DeviceJob) ResolveEntity(ctx context.Context, client *api.Client, tenan
 
 func (d *DeviceJob) LogCachedEntity(entity api.ResolvedEntity) {
 	device := entity.(*api.Device)
-	logging.Info("Using cached device: %s (MachineID: %s)", device.ComputerDNSName, device.MachineID)
+	logging.Info("using cached device",
+		"hostname", device.ComputerDNSName,
+		"machine_id", device.MachineID)
 }
 
 func (d *DeviceJob) LogResolvedEntity(entity api.ResolvedEntity) {
 	device := entity.(*api.Device)
-	logging.Info("Resolved device %s -> MachineID: %s, SenseVersion: %s",
-		device.ComputerDNSName, device.MachineID, device.SenseClientVersion)
+	logging.Info("resolved device",
+		"hostname", device.ComputerDNSName,
+		"machine_id", device.MachineID,
+		"sense_version", device.SenseClientVersion)
 }
 
 func (d *DeviceJob) DownloadTimeline(ctx context.Context, client *api.Client, entity api.ResolvedEntity, writer *output.JSONLWriter, progressCallback func(int, time.Time)) (int, error) {
-	return api.DownloadDeviceTimeline(ctx, client, entity.(*api.Device), d.fromDate, d.toDate, d.TimelineOpts, writer, progressCallback)
+	return api.DownloadDeviceTimeline(ctx, client, entity.(*api.Device), d.fromDate, d.toDate, d.TimelineOpts, writer, progressCallback, d.id)
 }
 
 // IdentityJob represents an identity timeline download job
@@ -161,17 +165,22 @@ func (i *IdentityJob) ResolveEntity(ctx context.Context, client *api.Client, ten
 
 func (i *IdentityJob) LogCachedEntity(entity api.ResolvedEntity) {
 	identity := entity.(*api.Identity)
-	logging.Info("Using cached identity: %s@%s", identity.AccountName, identity.AccountDomain)
+	logging.Info("using cached identity",
+		"account_name", identity.AccountName,
+		"account_domain", identity.AccountDomain)
 }
 
 func (i *IdentityJob) LogResolvedEntity(entity api.ResolvedEntity) {
 	identity := entity.(*api.Identity)
-	logging.Info("Resolved identity %s -> %s@%s", i.Input.Value, identity.AccountName, identity.AccountDomain)
+	logging.Info("resolved identity",
+		"search_term", i.Input.Value,
+		"account_name", identity.AccountName,
+		"account_domain", identity.AccountDomain)
 }
 
 func (i *IdentityJob) DownloadTimeline(ctx context.Context, client *api.Client, entity api.ResolvedEntity, writer *output.JSONLWriter, progressCallback func(int, time.Time)) (int, error) {
 	// JSONLWriter implements TruncatableWriter
-	return api.DownloadIdentityTimeline(ctx, client, entity.(*api.Identity), i.fromDate, i.toDate, i.PageSize, writer, progressCallback)
+	return api.DownloadIdentityTimeline(ctx, client, entity.(*api.Identity), i.fromDate, i.toDate, i.PageSize, writer, progressCallback, i.id)
 }
 
 // MergeJob represents a chunk merge job (separate from download jobs)

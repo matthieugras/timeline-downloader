@@ -1,21 +1,14 @@
 package logging
 
 import (
-	"fmt"
+	"log/slog"
 	"os"
-	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// Logger writes log messages to a file
-type Logger struct {
-	mu   sync.Mutex
-	file *os.File
-}
-
 // Global logger instance (accessed atomically for thread-safety)
-var globalLogger atomic.Pointer[Logger]
+var globalLogger atomic.Pointer[slog.Logger]
 
 // Init initializes the global logger with the specified file path
 // If path is empty, logging is disabled
@@ -26,80 +19,121 @@ func Init(path string) error {
 
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
-		return fmt.Errorf("failed to open log file: %w", err)
+		return err
 	}
 
-	logger := &Logger{file: file}
+	handler := slog.NewJSONHandler(file, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	})
+	logger := slog.New(handler)
 	globalLogger.Store(logger)
 
 	// Write header
-	Info("=== Timeline Downloader Log Started ===")
+	Info("Timeline Downloader log started")
 
 	return nil
 }
 
-// Close closes the global logger, ensuring all pending writes complete first.
-// Sets file to nil under lock to prevent race with concurrent log() calls.
+// Close closes the global logger
+// Note: slog doesn't require explicit close; the file will be closed when the process exits
+// or when the caller closes the underlying file handle if needed
 func Close() {
-	logger := globalLogger.Swap(nil)
-	if logger != nil {
-		logger.mu.Lock()
-		if logger.file != nil {
-			logger.file.Close()
-			logger.file = nil // Prevent writes to closed file
-		}
-		logger.mu.Unlock()
-	}
+	globalLogger.Store(nil)
 }
 
-// Info logs an info message
-func Info(format string, args ...any) {
+// Info logs an info message with structured key-value pairs
+func Info(msg string, args ...any) {
 	logger := globalLogger.Load()
 	if logger == nil {
 		return
 	}
-	logger.log("INFO", format, args...)
+	logger.Info(msg, args...)
 }
 
-// Error logs an error message
-func Error(format string, args ...any) {
+// Error logs an error message with structured key-value pairs
+func Error(msg string, args ...any) {
 	logger := globalLogger.Load()
 	if logger == nil {
 		return
 	}
-	logger.log("ERROR", format, args...)
+	logger.Error(msg, args...)
 }
 
-// Warn logs a warning message
-func Warn(format string, args ...any) {
+// Warn logs a warning message with structured key-value pairs
+func Warn(msg string, args ...any) {
 	logger := globalLogger.Load()
 	if logger == nil {
 		return
 	}
-	logger.log("WARN", format, args...)
+	logger.Warn(msg, args...)
 }
 
-// Debug logs a debug message
-func Debug(format string, args ...any) {
+// Debug logs a debug message with structured key-value pairs
+func Debug(msg string, args ...any) {
 	logger := globalLogger.Load()
 	if logger == nil {
 		return
 	}
-	logger.log("DEBUG", format, args...)
+	logger.Debug(msg, args...)
 }
 
-func (l *Logger) log(level, format string, args ...any) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	// Check if file was closed (race with Close())
-	if l.file == nil {
+// InfoWithJob logs an info message with job ID context
+func InfoWithJob(jobID int, msg string, args ...any) {
+	logger := globalLogger.Load()
+	if logger == nil {
 		return
 	}
+	allArgs := append([]any{"job_id", jobID}, args...)
+	logger.Info(msg, allArgs...)
+}
 
-	timestamp := time.Now().Format("2006-01-02 15:04:05")
-	msg := fmt.Sprintf(format, args...)
-	fmt.Fprintf(l.file, "[%s] %s: %s\n", timestamp, level, msg)
+// ErrorWithJob logs an error message with job ID context
+func ErrorWithJob(jobID int, msg string, args ...any) {
+	logger := globalLogger.Load()
+	if logger == nil {
+		return
+	}
+	allArgs := append([]any{"job_id", jobID}, args...)
+	logger.Error(msg, allArgs...)
+}
+
+// WarnWithJob logs a warning message with job ID context
+func WarnWithJob(jobID int, msg string, args ...any) {
+	logger := globalLogger.Load()
+	if logger == nil {
+		return
+	}
+	allArgs := append([]any{"job_id", jobID}, args...)
+	logger.Warn(msg, allArgs...)
+}
+
+// DebugWithJob logs a debug message with job ID context
+func DebugWithJob(jobID int, msg string, args ...any) {
+	logger := globalLogger.Load()
+	if logger == nil {
+		return
+	}
+	allArgs := append([]any{"job_id", jobID}, args...)
+	logger.Debug(msg, allArgs...)
+}
+
+// LogChunkBoundary logs chunk boundary information with nanosecond precision timestamps
+func LogChunkBoundary(jobID, chunkIndex, totalChunks int, fromNano, toNano int64) {
+	logger := globalLogger.Load()
+	if logger == nil {
+		return
+	}
+	fromTime := time.Unix(0, fromNano).UTC()
+	toTime := time.Unix(0, toNano).UTC()
+	logger.Info("chunk boundary",
+		"job_id", jobID,
+		"chunk_index", chunkIndex,
+		"total_chunks", totalChunks,
+		"from_nano", fromNano,
+		"to_nano", toNano,
+		"from", fromTime.Format(time.RFC3339),
+		"to", toTime.Format(time.RFC3339),
+	)
 }
 
 // IsEnabled returns true if logging is enabled
