@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -232,6 +233,14 @@ func (ea *ESTSAuthenticator) establishSessionLocked(ctx context.Context) error {
 		return fmt.Errorf("failed to read auth response: %w", err)
 	}
 
+	// 5.5. Handle MCAS intermediate flow if detected
+	if ea.isMCASResponse(body) {
+		body, err = ea.handleMCASFlow(ctx, transientClient, body)
+		if err != nil {
+			return err
+		}
+	}
+
 	// 6. Parse HTML form for OIDC tokens
 	formData, err := ea.parseOIDCForm(body)
 	if err != nil {
@@ -250,6 +259,7 @@ func (ea *ESTSAuthenticator) establishSessionLocked(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to exchange tokens: %w", err)
 	}
+	body, err = io.ReadAll(resp.Body)
 	resp.Body.Close()
 
 	// 8. Extract session cookies from transient jar into struct state
@@ -316,7 +326,8 @@ func (ea *ESTSAuthenticator) parseOIDCForm(body []byte) (url.Values, error) {
 			}
 		}
 
-		formData.Set(field, match[1])
+		// Decode HTML entities (e.g., &amp; -> &) in the extracted value
+		formData.Set(field, html.UnescapeString(match[1]))
 	}
 
 	return formData, nil
@@ -385,4 +396,74 @@ func (ea *ESTSAuthenticator) extractCookiesFromJar(jar http.CookieJar) error {
 	}
 
 	return nil
+}
+
+// isMCASResponse checks if the HTML response is an MCAS intermediate form.
+// MCAS (Microsoft Cloud App Security) adds an extra authentication step where
+// the login.microsoftonline.com response redirects through an MCAS endpoint.
+func (ea *ESTSAuthenticator) isMCASResponse(body []byte) bool {
+	// Check for form action URL containing .access.mcas.ms
+	mcasActionRegex := regexp.MustCompile(`<form[^>]+action=["'][^"']*\.access\.mcas\.ms[^"']*["']`)
+	return mcasActionRegex.Match(body)
+}
+
+// handleMCASFlow handles the MCAS authentication flow when detected.
+// It extracts the MCAS form data, POSTs to the MCAS endpoint, and returns
+// the final response body containing the actual OIDC tokens.
+func (ea *ESTSAuthenticator) handleMCASFlow(ctx context.Context, client *http.Client, body []byte) ([]byte, error) {
+	bodyStr := string(body)
+
+	// Extract the MCAS action URL from the form
+	actionRegex := regexp.MustCompile(`<form[^>]+action=["']([^"']*\.access\.mcas\.ms[^"']*)["']`)
+	actionMatch := actionRegex.FindStringSubmatch(bodyStr)
+	if len(actionMatch) < 2 {
+		return nil, &ESTSError{
+			ErrorCode: "mcas_parse_error",
+			Message:   "Failed to extract MCAS action URL from response",
+		}
+	}
+	mcasActionURL := actionMatch[1]
+
+	// Extract id_token from the form
+	// Try: <input type="hidden" name="id_token" value="..."/>
+	idTokenRegex := regexp.MustCompile(`<input[^>]+name=["']id_token["'][^>]+value=["']([^"']*)["']`)
+	idTokenMatch := idTokenRegex.FindStringSubmatch(bodyStr)
+
+	// Also try reversed order: value before name
+	if idTokenMatch == nil {
+		idTokenRegex = regexp.MustCompile(`<input[^>]+value=["']([^"']*)["'][^>]+name=["']id_token["']`)
+		idTokenMatch = idTokenRegex.FindStringSubmatch(bodyStr)
+	}
+
+	if len(idTokenMatch) < 2 {
+		return nil, &ESTSError{
+			ErrorCode: "mcas_parse_error",
+			Message:   "Failed to extract id_token from MCAS form",
+		}
+	}
+	idToken := idTokenMatch[1]
+
+	// POST id_token to the MCAS endpoint
+	formData := url.Values{}
+	formData.Set("id_token", idToken)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", mcasActionURL, strings.NewReader(formData.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create MCAS request: %w", err)
+	}
+	req.Header.Set("User-Agent", ea.userAgent)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to complete MCAS flow: %w", err)
+	}
+	defer resp.Body.Close()
+
+	mcasBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read MCAS response: %w", err)
+	}
+
+	return mcasBody, nil
 }
