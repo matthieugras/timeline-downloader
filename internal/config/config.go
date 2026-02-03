@@ -55,11 +55,12 @@ type Config struct {
 	LogFile string `mapstructure:"log-file"`
 
 	// Timeline API options
-	GenerateIdentityEvents bool `mapstructure:"generate-identity-events"`
-	IncludeIdentityEvents  bool `mapstructure:"include-identity-events"`
-	SupportMdiOnlyEvents   bool `mapstructure:"support-mdi-only-events"`
-	IncludeSentinelEvents  bool `mapstructure:"include-sentinel-events"`
-	PageSize               int  `mapstructure:"page-size"`
+	GenerateIdentityEvents bool   `mapstructure:"generate-identity-events"`
+	IncludeIdentityEvents  bool   `mapstructure:"include-identity-events"`
+	SupportMdiOnlyEvents   bool   `mapstructure:"support-mdi-only-events"`
+	IncludeSentinelEvents  bool   `mapstructure:"include-sentinel-events"`
+	PageSize               int    `mapstructure:"page-size"`
+	Search                 string `mapstructure:"search"`
 
 	// Retry settings
 	MaxRetries int `mapstructure:"max-retries"`
@@ -132,6 +133,7 @@ func SetupFlags(cmd *cobra.Command) {
 	cmd.Flags().Bool("support-mdi-only-events", true, "Include supportMdiOnlyEvents in API requests")
 	cmd.Flags().Bool("include-sentinel-events", true, "Include includeSentinelEvents in API requests")
 	cmd.Flags().Int("page-size", 1000, "Number of events per API page (1-1000)")
+	cmd.Flags().String("search", "", "Search filter for device timeline events (only applied to initial request)")
 
 	// Retry settings
 	cmd.Flags().Int("max-retries", 10, "Maximum retries for API requests")

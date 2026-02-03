@@ -113,6 +113,7 @@ func run(cmd *cobra.Command, args []string) error {
 		SupportMdiOnlyEvents:   cfg.SupportMdiOnlyEvents,
 		IncludeSentinelEvents:  cfg.IncludeSentinelEvents,
 		PageSize:               cfg.PageSize,
+		Search:                 cfg.Search,
 	}
 
 	// Setup API client (shares HTTP client for connection pooling)

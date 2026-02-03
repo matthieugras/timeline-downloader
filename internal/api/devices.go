@@ -44,6 +44,7 @@ type DeviceTimelineOptions struct {
 	SupportMdiOnlyEvents   bool
 	IncludeSentinelEvents  bool
 	PageSize               int
+	Search                 string
 }
 
 // Device represents a machine from Microsoft Defender
@@ -298,6 +299,9 @@ func buildDeviceTimelineURL(device *Device, fromDate, toDate time.Time, opts Dev
 	q.Set("pageSize", fmt.Sprintf("%d", opts.PageSize))
 	q.Set("includeSentinelEvents", fmt.Sprintf("%t", opts.IncludeSentinelEvents))
 	q.Set("IsScrollingForward", "true")
+	if opts.Search != "" {
+		q.Set("search", opts.Search)
+	}
 
 	return fmt.Sprintf("/apiproxy/mtp/mdeTimelineExperience/machines/%s/events/?%s",
 		device.MachineID, q.Encode())
