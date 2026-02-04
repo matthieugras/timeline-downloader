@@ -289,12 +289,16 @@ func (c *Client) doPostRequestWithRetryAndHeaders(ctx context.Context, path stri
 func parseJSONResponse(resp *http.Response, v any) error {
 	defer resp.Body.Close()
 
-	decoder := json.NewDecoder(resp.Body)
+	respBody, _ := io.ReadAll(resp.Body)
+	decoder := json.NewDecoder(bytes.NewReader(respBody))
 	if err := decoder.Decode(v); err != nil {
+
 		logging.Error("failed to parse JSON response",
 			"url", resp.Request.URL.String(),
 			"status", resp.StatusCode,
+			"response_body", string(respBody),
 			"error", err)
+
 		return fmt.Errorf("failed to parse response: %w", err)
 	}
 
